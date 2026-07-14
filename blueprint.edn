@@ -1,0 +1,11 @@
+[{:itonami.blueprint/social-impact [:operational-efficiency :worker-safety :equipment-coordination]
+  :itonami.blueprint/domain :mining/management
+  :itonami.blueprint/required-technologies [:robotics :identity :forms :dmn :bpmn :audit-ledger]
+  :itonami.blueprint/isco-08 "1322"
+  :itonami.blueprint/name "Mining Manager Administrative Support"
+  :itonami.blueprint/governor :mining-manager-governor
+  :itonami.blueprint/robotics true
+  :db/id -1
+  :itonami.blueprint/status :public-oss
+  :itonami.blueprint/id "cloud-itonami-isco-1322"
+  :itonami.blueprint/license "AGPL-3.0-or-later"}]
