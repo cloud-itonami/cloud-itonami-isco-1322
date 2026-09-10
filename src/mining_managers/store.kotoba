@@ -1,10 +1,28 @@
 (ns mining-managers.store
-  "Store protocol and in-memory implementation for mining manager administrative
-  support. Maintains registered managers, registered mine-sites, committed
-  operational records, and an append-only audit ledger.
+  "Store protocol and in-memory implementation for the ISCO-08 1322 mining
+  manager administrative support actor. Maintains registered managers,
+  registered mine-sites, committed operational records, and a hash-chained
+  append-only audit ledger.
 
-  The Store is the system of record and never exposed to the Advisor; only the
-  Governor and Actor have store access (itonami actor pattern).")
+  The Store is the system of record and never exposed to the Advisor; only
+  the Governor and Actor have store access (itonami actor pattern).
+
+  ## What changed from acfd967, and why
+
+  The shipped protocol had one write for everything, `log-record!`, which
+  stamped a host `java.time.Instant` on each entry and pushed it onto an
+  `:audit-log` vector. Records and audit were the same list, so a reader
+  could not tell 'this shift was scheduled' from 'this proposal was refused'
+  without parsing the entry's `:type`; and the stamp made every entry
+  host-specific and non-reproducible, which is the wrong property for a
+  chain. Nothing called it anyway -- the actor never wrote (measured, see
+  `mining-managers.ledger`).
+
+  Records and ledger are now two things. `commit-record!` is the write the
+  README's contract talks about; `append-ledger!` is the audit trail of every
+  disposition including the ones that did not write. The ledger is extended
+  only through `mining-managers.ledger/append`, which is where the chain is."
+  (:require [mining-managers.ledger :as led]))
 
 (defprotocol Store
   "Operational store for mining manager administrative support."
@@ -13,22 +31,29 @@
     "Returns the registered manager record or nil.")
 
   (register-manager! [store record]
-    "Registers a new manager {manager-id, name, certifications, experience-years}.
-     Returns the updated store.")
+    "Registers a manager {manager-id, name, certifications, experience-years}.
+     Returns the store.")
 
   (mine-site [store site-id]
     "Returns the registered mine-site record or nil.")
 
   (register-site! [store record]
-    "Registers a new mine-site {site-id, operator-id, location, risk-level}.
-     Returns the updated store.")
+    "Registers a mine-site {site-id, operator-id, location, risk-level}.
+     Returns the store.")
 
-  (log-record! [store record-type record-data]
-    "Appends an operational record (shift, production, maintenance, incident).
-     Always append-only; returns updated store.")
+  (commit-record! [store record]
+    "Appends a committed operational record (a shift, a production report,
+     a maintenance window, an approved safety concern). Returns the store.")
 
-  (get-audit-log [store]
-    "Returns the full append-only audit ledger (immutable vector)."))
+  (records [store]
+    "Every committed record, in commit order.")
+
+  (append-ledger! [store entry]
+    "Appends a plain entry map to the hash-chained audit ledger. Returns the
+     store.")
+
+  (ledger [store]
+    "The full append-only audit ledger, chained (see mining-managers.ledger)."))
 
 (defrecord MemStore [a]
   Store
@@ -44,17 +69,27 @@
   (register-site! [s record]
     (swap! a assoc-in [:mine-sites (:site-id record)] record) s)
 
-  (log-record! [s record-type record-data]
-    (let [entry {:timestamp #?(:clj (java.time.Instant/now)
-                               :cljs (js/Date.))
-                 :type record-type
-                 :data record-data}]
-      (swap! a update :audit-log (fnil conj []) entry) s))
+  (commit-record! [s record]
+    ;; A record is a fact about a manager at a site; one without either is
+    ;; not a fact this store can hold, and silently storing it would make
+    ;; `records` unqueryable by the two keys everything else joins on.
+    (when-not (and (map? record) (some? (:manager-id record)) (some? (:site-id record)))
+      (throw (ex-info "commit-record!: record must carry :manager-id and :site-id"
+                      {:record record})))
+    (swap! a update :records (fnil conj []) record) s)
 
-  (get-audit-log [_]
-    (:audit-log @a)))
+  (records [_]
+    (or (:records @a) []))
+
+  (append-ledger! [s entry]
+    (swap! a update :ledger #(led/append (or % []) entry)) s)
+
+  (ledger [_]
+    (or (:ledger @a) [])))
 
 (defn mem-store
+  "An in-memory store. `seed` may carry `:managers` and `:mine-sites` maps
+  keyed by id, which is what `mining-managers.sim` uses."
   ([] (mem-store {}))
   ([seed]
-   (->MemStore (atom (merge {:managers {} :mine-sites {} :audit-log []} seed)))))
+   (->MemStore (atom (merge {:managers {} :mine-sites {} :records [] :ledger []} seed)))))

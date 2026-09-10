@@ -1,0 +1,42 @@
+(ns mining-managers.run-sim
+  "Entry point for the governed-scenario harness: load this actor's .kotoba
+  sources and run `mining-managers.sim`.
+
+  ## Why this file exists
+
+  `mining-managers.sim` is the harness; this is only the way to start it. It
+  needs to be separate because `-m mining-managers.sim` cannot work on this
+  tree -- `-m` resolves a namespace through `require`, and `require` looks for
+  .clj/.cljc. `clojure -M <path>` loads by reader and ignores the extension,
+  so the entry point is a path. The loading itself is
+  `mining-managers.bootstrap`, shared with run_tests.kotoba.
+
+  ## Exit codes
+
+      0  every scenario reached its expected phase, no refusal wrote
+         anything, every ledger verified, and at least one refusal was
+         demonstrated
+      1  the run did not meet that bar -- including the case where the
+         scenario table demonstrated no refusal at all
+      2  REFUSED -- the harness itself did not load
+
+  The 1 clause is the point. A governed actor's claim is that there exist
+  actions it refuses; a harness that ran only clean scenarios would print
+  green while showing nothing, so zero refusals is a failure and not a pass."
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]))
+
+(load-file "load_sources.kotoba")
+
+(let [root (or (System/getProperty "mining-managers.root") ".")]
+  (mining-managers.bootstrap/load-all! (mining-managers.bootstrap/describe root))
+  (let [run    (resolve 'mining-managers.sim/run)
+        report (resolve 'mining-managers.sim/report)]
+    (when-not (and run report)
+      (println "  REFUSING TO REPORT A PASS: mining-managers.sim did not load")
+      (flush)
+      (System/exit 2))
+    (let [r (run)]
+      (print (report r))
+      (flush)
+      (System/exit (if (:ok? r) 0 1)))))

@@ -1,0 +1,38 @@
+(ns mining-managers.phase-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [mining-managers.phase :as phase]))
+
+(deftest of-verdict-routes-three-ways
+  (is (= :hold (phase/of-verdict {:hard? true :escalate? false})))
+  (is (= :request-approval (phase/of-verdict {:hard? false :escalate? true})))
+  (is (= :commit (phase/of-verdict {:hard? false :escalate? false :ok? true}))))
+
+(deftest hard-outranks-escalate
+  (testing "a verdict that is both must hold -- a human cannot say yes to a hard violation"
+    (is (= :hold (phase/of-verdict {:hard? true :escalate? true})))))
+
+(deftest only-commit-writes
+  (is (phase/writes? :commit))
+  (is (not (phase/writes? :hold)))
+  (is (not (phase/writes? :request-approval)))
+  (is (not (phase/writes? :no-such-phase))))
+
+(deftest only-request-approval-needs-a-human
+  (is (phase/human-required? :request-approval))
+  (is (not (phase/human-required? :commit)))
+  (is (not (phase/human-required? :hold))))
+
+(deftest hold-and-request-approval-are-refusals
+  (is (phase/refusal? :hold))
+  (is (phase/refusal? :request-approval))
+  (is (not (phase/refusal? :commit))))
+
+(deftest terminal-phases
+  (is (phase/terminal? :hold))
+  (is (phase/terminal? :commit))
+  (is (not (phase/terminal? :request-approval))))
+
+(deftest approved-commit-is-reached-from-request-approval
+  (is (phase/approved-commit? :request-approval))
+  (is (not (phase/approved-commit? :commit)))
+  (is (not (phase/approved-commit? nil))))

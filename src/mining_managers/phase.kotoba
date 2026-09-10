@@ -1,0 +1,61 @@
+(ns mining-managers.phase
+  "The verdict -> phase mapping for the ISCO-08 1322 mining manager
+  administrative support actor, and what each phase is allowed to do.
+
+  Runtime: portable (pure functions over data, no host interop).
+
+  ## Why this namespace exists
+
+  The mapping used to be an inline `cond` -- twice: once inside
+  `build-graph`'s `:decide` node and once again inside `run-request!`, which
+  on acfd967 did not run the graph at all but re-implemented the same
+  `cond` in a threading macro. Two copies of the routing rule that decides
+  whether a proposal is written, held, or sent to a human, neither with a
+  test of its own and neither with a name a ledger entry could carry.
+
+  Three phases, and the ordering between them is the whole safety claim:
+
+      :hold             hard violation. Never written. Not overridable.
+      :request-approval escalation. Written only after a human resumes.
+      :commit           clean. Written.
+
+  `of-verdict` checks `:hard?` before `:escalate?` deliberately. A proposal
+  that is both hard-blocked and low-confidence must hold, not escalate --
+  escalating it would put a question to a human that they have no authority to
+  answer yes to.")
+
+(def phases
+  "Every phase this actor can route to, with what it may do."
+  {:hold             {:writes? false :human-required? false :terminal? true}
+   :request-approval {:writes? false :human-required? true  :terminal? false}
+   :commit           {:writes? true  :human-required? false :terminal? true}})
+
+(defn of-verdict
+  "Route a governor verdict to a phase. Pure."
+  [verdict]
+  (cond
+    (:hard? verdict)     :hold
+    (:escalate? verdict) :request-approval
+    :else                :commit))
+
+(defn writes? [phase] (boolean (get-in phases [phase :writes?])))
+(defn human-required? [phase] (boolean (get-in phases [phase :human-required?])))
+(defn terminal? [phase] (boolean (get-in phases [phase :terminal?])))
+
+(defn refusal?
+  "True for phases that did not write. Both `:hold` and `:request-approval`
+  are refusals of the proposal as submitted -- the second one is a refusal to
+  act without a human, not an approval-in-waiting. `mining-managers.sim`
+  counts these; a run that produces none has demonstrated nothing."
+  [phase]
+  (not (writes? phase)))
+
+(defn approved-commit?
+  "True when a commit is being reached from an escalation, i.e. a human
+  resumed the interrupted thread. The commit node records this so the audit
+  ledger can distinguish a human-approved write from an automatic one --
+  on acfd967 nothing was written in either case, so there was nothing to
+  distinguish; the shipped `approve!` set `:outcome :committed` on whatever
+  map it was handed, including a held one."
+  [disposition]
+  (= :request-approval disposition))

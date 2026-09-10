@@ -1,0 +1,104 @@
+(ns mining-managers.ledger-test
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
+            [mining-managers.ledger :as led]))
+
+(defn- three-entries []
+  (-> []
+      (led/append (led/commit-entry {:manager-id "m" :site-id "s" :op :schedule-shift} :actor))
+      (led/append (led/hold-entry {:hard? true :violations [{:rule :no-site}]}))
+      (led/append (led/commit-entry {:manager-id "m" :site-id "s" :op :coordinate-maintenance} :human))))
+
+(deftest an-intact-chain-verifies
+  (let [l (three-entries)]
+    (is (= {:ok? true :length 3} (led/verify l)))
+    (is (= [0 1 2] (mapv :ledger/seq l)))
+    (is (= 0 (:ledger/prev (first l))))
+    (is (= (:ledger/hash (nth l 0)) (:ledger/prev (nth l 1))))
+    (is (= (:ledger/hash (nth l 1)) (:ledger/prev (nth l 2))))))
+
+(deftest the-empty-ledger-verifies
+  (is (= {:ok? true :length 0} (led/verify []))))
+
+(deftest a-modified-entry-breaks-the-chain-at-its-own-index
+  (testing "changing content after the fact is detected where it happened"
+    (let [l (three-entries)
+          tampered (assoc-in l [1 :verdict :violations] [])]
+      (is (= {:ok? false :length 3 :broken-at 1 :reason :hash-mismatch}
+             (led/verify tampered))))))
+
+(deftest a-dropped-entry-breaks-the-chain
+  (testing "removing a middle entry is detected at the first entry after it"
+    (let [l (three-entries)
+          dropped (vec (concat (subvec l 0 1) (subvec l 2)))]
+      (is (= :seq-mismatch (:reason (led/verify dropped))))
+      (is (= 1 (:broken-at (led/verify dropped)))))))
+
+(deftest a-reordered-ledger-breaks-the-chain
+  (let [l (three-entries)
+        swapped [(nth l 1) (nth l 0) (nth l 2)]]
+    (is (false? (:ok? (led/verify swapped))))
+    (is (= 0 (:broken-at (led/verify swapped))))))
+
+(deftest an-entry-at-the-array-map-boundary-verifies
+  (testing "six own keys: eight at hashing time (array-map), nine at verify time (hash-map)"
+    ;; `entry` hashes `body` = m + :ledger/seq + :ledger/prev. With six own
+    ;; keys that is eight, the array-map ceiling, so it prints in insertion
+    ;; order. The stored entry has nine and is a hash-map; `(dissoc e
+    ;; :ledger/hash)` stays a hash-map and prints in hash order. Without
+    ;; `canonical` the chain hashes one order and verifies the other --
+    ;; measured here: :hash-mismatch at 0. This is the exact boundary
+    ;; cloud-itonami-isco-3133 hit on 2026-09-11; this actor's own
+    ;; escalate-entry has seven own keys and sits past it, so the boundary
+    ;; is pinned with an explicit six-key map rather than with escalate-entry.
+    (let [m (array-map :disposition :escalate :phase :request-approval :approved-by :pending
+                       :manager-id "m" :op :flag-safety-concern :confidence 0.9)
+          l (led/append [] m)
+          e (first l)
+          body (assoc m :ledger/seq 0 :ledger/prev 0)]
+      (is (= 9 (count e)))
+      (is (not= (pr-str (dissoc e :ledger/hash)) (pr-str body))
+          "the probe must actually differ in print order")
+      (is (= {:ok? true :length 1} (led/verify l))))))
+
+(deftest an-escalate-entry-past-the-boundary-verifies
+  (let [e (led/escalate-entry {:manager-id "m" :site {:site-id "s"}} {:op :flag-safety-concern} {:confidence 0.9})
+        l (led/append [] e)]
+    (is (= 10 (count (first l))))
+    (is (= {:ok? true :length 1} (led/verify l)))))
+
+(deftest chain-hash-is-a-function-of-the-value-not-the-map-type
+  (testing "the same content in two print orders hashes identically"
+    ;; The array-map is built in the REVERSE of the hash-map's seq order, so
+    ;; the two print differently and only a canonicalised hash agrees. The
+    ;; isco-3133 first draft of this test built both in the same order and
+    ;; stayed green with `canonical` removed -- measured 2026-09-11 by mutation.
+    (let [content (into {} (map (fn [i] [(keyword (str "k" i)) i]) (range 12)))
+          as-array (apply array-map (mapcat identity (reverse (seq content))))
+          as-hash (into (hash-map) content)]
+      (is (= content as-array as-hash))
+      (is (not= (pr-str as-array) (pr-str as-hash)) "the probe must actually differ in print order")
+      (is (= (led/chain-hash 0 as-array) (led/chain-hash 0 as-hash))))))
+
+(deftest chain-hash-differs-when-content-or-position-differs
+  (is (not= (led/chain-hash 0 {:a 1}) (led/chain-hash 0 {:a 2})))
+  (is (not= (led/chain-hash 0 {:a 1}) (led/chain-hash 1 {:a 1}))))
+
+(deftest commit-entries-say-who-approved
+  (is (= :human (:approved-by (led/commit-entry {} :human))))
+  (is (= :actor (:approved-by (led/commit-entry {} :actor))))
+  (is (= :none (:approved-by (led/hold-entry {}))))
+  (is (= :pending (:approved-by (led/escalate-entry {} {} {})))))
+
+(deftest escalate-entry-carries-enough-to-explain-itself
+  (let [e (led/escalate-entry {:manager-id "m-1" :site {:site-id "s-1"}} {:op :flag-safety-concern} {:confidence 0.9})]
+    (is (= :escalate (:disposition e)))
+    (is (= :request-approval (:phase e)))
+    (is (= "m-1" (:manager-id e)))
+    (is (= "s-1" (:site-id e)))
+    (is (= :flag-safety-concern (:op e)))
+    (is (= 0.9 (:confidence e)))))
+
+(deftest summary-has-one-line-per-entry
+  (let [l (three-entries)]
+    (is (= 3 (count (str/split-lines (led/summary l)))))))

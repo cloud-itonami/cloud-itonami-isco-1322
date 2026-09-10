@@ -1,0 +1,81 @@
+(ns mining-managers.run-lint
+  "Lint this repository's .kotoba sources, and refuse to report a pass on a
+  run that linted nothing.
+
+  ## Why this file exists
+
+  `clj-kondo --lint src test` reports `errors: 0, warnings: 0` on this
+  repository and always will, because clj-kondo's directory traversal
+  collects .clj/.cljc/.cljs and this repository's sources are .kotoba. It is
+  not that the sources are clean; it is that none of them were read.
+  Measured on acfd967 (origin/main after the .kotoba rename):
+
+      linting took 9ms, errors: 0, warnings: 0
+
+  and at the pin before the rename (18aeef6), the same alias on the same
+  content as .clj/.cljc:
+
+      linting took 1165ms, errors: 0, warnings: 4
+
+  Four warnings became zero without a source changing, because zero files
+  were read. clj-kondo lints a .kotoba file perfectly well when the file is
+  named explicitly; what it will not do is *find* one by walking a directory.
+  Passing both the directory and the file does not help either -- a path
+  already covered by a directory in the same run is deduplicated, and the
+  directory is what skips it. So the file list has to be built here, and the
+  directories must not be passed at all.
+
+  ## Why :lang :cljc
+
+  clj-kondo decides whether reader conditionals are legal from the file
+  extension, exactly as the Clojure Compiler does, so every `#?(...)` in this
+  tree would lint as `Reader conditionals are only allowed in .cljc files`.
+  These sources *are* .cljc content; only the extension moved. `:lang :cljc`
+  tells clj-kondo what it is reading. It is not a suppression: with it set, a
+  genuine arity error in the same file is still reported.
+
+  ## The floor
+
+  A linter that reads no files reports exactly what a linter that read every
+  file and found nothing reports. So the count of files linted is checked, and
+  zero is a refusal rather than a pass -- the same three-valued contract as
+  run_tests.kotoba:
+
+      0  linted at least one file, no errors
+      1  linted, and found at least one error
+      2  REFUSED -- could not answer (no lintable files found)"
+  (:require [clojure.java.io :as io]
+            [clj-kondo.core :as kondo])
+  (:import [java.io File]))
+
+(def source-ext #{"kotoba" "cljc" "cljs" "clj"})
+
+(defn- ext-of [^String n]
+  (let [i (.lastIndexOf n ".")] (when (pos? i) (subs n (inc i)))))
+
+(defn- sources-under [dir]
+  (let [d (io/file dir)]
+    (when (.isDirectory d)
+      (->> (file-seq d)
+           (filter #(.isFile ^File %))
+           (filter #(source-ext (ext-of (.getName ^File %))))
+           (map #(.getPath ^File %))
+           sort))))
+
+(let [files (vec (mapcat sources-under ["src" "test"]))]
+  (when (empty? files)
+    (println (str "  REFUSING TO REPORT A PASS: no lintable files found under "
+                  "src/ or test/ with extensions " (pr-str (sort source-ext))))
+    (flush)
+    (System/exit 2))
+  (let [{:keys [findings]} (kondo/run! {:lint files :lang :cljc})
+        errors   (filterv #(= :error (:level %)) findings)
+        warnings (filterv #(= :warning (:level %)) findings)]
+    (doseq [f findings]
+      (println (format "%s:%s:%s: %s: %s"
+                       (:filename f) (:row f) (:col f)
+                       (name (:level f)) (:message f))))
+    (println (format "  linted %d file(s): %d error(s), %d warning(s)"
+                     (count files) (count errors) (count warnings)))
+    (flush)
+    (System/exit (if (seq errors) 1 0))))
