@@ -1,0 +1,67 @@
+(ns mining-managers.store-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [mining-managers.ledger :as led]
+            [mining-managers.store :as store]))
+
+(deftest an-empty-store-has-no-records-and-no-ledger
+  (let [s (store/mem-store)]
+    (is (= [] (store/records s)))
+    (is (= [] (store/ledger s)))
+    (is (nil? (store/manager s "m")))
+    (is (nil? (store/mine-site s "s")))))
+
+(deftest a-seeded-store-answers-by-id
+  (let [s (store/mem-store {:managers {"m-1" {:manager-id "m-1" :name "A"}}
+                            :mine-sites {"s-1" {:site-id "s-1" :risk-level :low}}})]
+    (is (= "A" (:name (store/manager s "m-1"))))
+    (is (= :low (:risk-level (store/mine-site s "s-1"))))
+    (is (nil? (store/manager s "m-2")))
+    (is (nil? (store/mine-site s "s-2")))))
+
+(deftest registration-is-keyed-by-id
+  (let [s (store/mem-store)]
+    (store/register-manager! s {:manager-id "m-1" :name "A"})
+    (store/register-site! s {:site-id "s-1" :risk-level :medium})
+    (is (= "A" (:name (store/manager s "m-1"))))
+    (is (= :medium (:risk-level (store/mine-site s "s-1"))))
+    (testing "re-registering replaces"
+      (store/register-site! s {:site-id "s-1" :risk-level :high})
+      (is (= :high (:risk-level (store/mine-site s "s-1")))))))
+
+(deftest commit-record-appends-in-order
+  (let [s (store/mem-store)
+        r1 {:manager-id "m" :site-id "s" :op :schedule-shift}
+        r2 {:manager-id "m" :site-id "s" :op :coordinate-maintenance}]
+    (store/commit-record! s r1)
+    (store/commit-record! s r2)
+    (is (= [r1 r2] (store/records s)))))
+
+(deftest commit-record-refuses-a-record-without-manager-and-site
+  (let [s (store/mem-store)]
+    (is (thrown? #?(:clj Exception :cljs js/Error) (store/commit-record! s {:op :schedule-shift})))
+    (is (thrown? #?(:clj Exception :cljs js/Error) (store/commit-record! s {:manager-id "m" :op :schedule-shift})))
+    (is (thrown? #?(:clj Exception :cljs js/Error) (store/commit-record! s {:site-id "s" :op :schedule-shift})))
+    (is (thrown? #?(:clj Exception :cljs js/Error) (store/commit-record! s "not a record")))
+    (is (= [] (store/records s)) "a refused record is not stored")))
+
+(deftest append-ledger-chains
+  (let [s (store/mem-store)
+        entry {:disposition :commit :record {:manager-id "m" :site-id "s" :op :schedule-shift}}]
+    (store/append-ledger! s entry)
+    (store/append-ledger! s (led/hold-entry {:hard? true}))
+    (is (= 2 (count (store/ledger s))))
+    (let [e (first (store/ledger s))]
+      (is (= entry (dissoc e :ledger/seq :ledger/prev :ledger/hash)))
+      (is (= 0 (:ledger/seq e)))
+      (is (= 0 (:ledger/prev e)))
+      (is (integer? (:ledger/hash e))))
+    (is (= 1 (:ledger/seq (second (store/ledger s)))))
+    (is (:ok? (led/verify (store/ledger s))))))
+
+(deftest records-and-ledger-are-separate
+  (let [s (store/mem-store)]
+    (store/append-ledger! s (led/hold-entry {:hard? true}))
+    (is (= [] (store/records s)) "a hold is audited but is not a record")
+    (store/commit-record! s {:manager-id "m" :site-id "s" :op :schedule-shift})
+    (is (= 1 (count (store/records s))))
+    (is (= 1 (count (store/ledger s))) "a record is not itself a ledger entry")))

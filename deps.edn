@@ -2,16 +2,27 @@
  :deps {io.github.kotoba-lang/langgraph
         {:git/sha "5b4e5e70837b849b14b6a5800894e3be202ad5fa"}}
  :aliases
- {
-  ;; clj-kondo from deps (no binary), errors fail CI. Added because this repo
-  ;; could not be linted at all -- across this fleet an absent or broken :lint
-  ;; alias is what let misplaced docstrings, dead code and even a false-green
-  ;; test verdict survive unreported (cloud-itonami-isic-561/563/920).
-  :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}
-         :main-opts    ["-m" "clj-kondo.main"
-                        "--lint" "src" "test"
-                        "--fail-level" "error"]}
+ {;; run_tests.kotoba, not cognitect.test-runner. The 2026-09-10 rename moved
+  ;; every source and test to .kotoba, which clojure.tools.namespace does not
+  ;; resolve -- cognitect.test-runner then found nothing, ran nothing and
+  ;; exited 0 (measured on acfd967: `Ran 0 tests containing 0 assertions`).
+  ;; `clojure -M <path>` loads by reader and ignores the extension, so the
+  ;; runner stays inside the rename. It refuses (exit 2) rather than report a
+  ;; pass when the run comes in under what README.md publishes.
   :test {:extra-paths ["test"]
-         :extra-deps {io.github.cognitect-labs/test-runner
-                      {:git/tag "v0.5.1" :git/sha "dfb30dd6605cb6c0efc275e1df1736f6e90d4d73"}}
-         :main-opts ["-m" "cognitect.test-runner"]}}}
+         :main-opts ["run_tests.kotoba"]}
+  ;; The governed-scenario harness. Exits non-zero when the scenario table
+  ;; demonstrated no refusal -- a governed actor that refuses nothing has
+  ;; shown nothing, and a harness that printed green there would be theatre.
+  ;; A path, not `-m mining-managers.sim`: `-m` resolves through `require`,
+  ;; which does not see .kotoba.
+  :sim  {:main-opts ["run_sim.kotoba"]}
+  ;; run_lint.kotoba, not `clj-kondo.main --lint src test`. clj-kondo's
+  ;; directory traversal collects .clj/.cljc/.cljs, so on this tree it walked
+  ;; src/ and test/, found nothing to read, and reported errors: 0 (measured
+  ;; on acfd967: `linting took 9ms, errors: 0, warnings: 0`; at the pin before
+  ;; the rename the same content reported 4 warnings) -- which is what a
+  ;; clean repository reports too. The runner builds the file list itself and
+  ;; refuses (exit 2) when that list is empty.
+  :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}
+         :main-opts    ["run_lint.kotoba"]}}}

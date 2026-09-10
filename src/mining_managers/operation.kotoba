@@ -1,0 +1,107 @@
+(ns mining-managers.operation
+  "The closed vocabulary of operations the ISCO-08 1322 mining manager
+  administrative support actor may propose.
+
+  Runtime: portable (pure data + pure predicates, no host interop).
+
+  ## Why this namespace exists
+
+  Before it, the operation vocabulary lived in three places that could not
+  disagree loudly: the README's prose list, the Advisor's docstring, and the
+  Governor's private `operator-class-ops` set of seven names. That made the
+  Governor a *denylist* -- it blocked seven named ops and admitted everything
+  else. Measured on acfd967, against a registered manager and a registered
+  `:risk-level :medium` site, with `:effect :propose` and `:confidence 0.95`:
+
+      op=:authorize-blast             ok?=true  hard?=false
+      op=:detonate                    ok?=true  hard?=false
+      op=:override-ventilation        ok?=true  hard?=false
+      op=:delete-shift-record         ok?=true  hard?=false
+      op=:set-ore-grade               ok?=true  hard?=false
+      op=:dispatch-crew-underground   ok?=true  hard?=false
+      op=\"schedule-shift\"             ok?=true  hard?=false   ; a string
+
+  The README's own boundary names \"Extraction/blasting decisions\" as
+  hard-blocked with no override path; `:blast` was in the set and
+  `:authorize-blast` and `:detonate` were not. An actor whose operation set
+  is open cannot be governed, because the governor is answering a question
+  about a vocabulary nobody declared. So the vocabulary is declared here,
+  once, as an allowlist, and `mining-managers.governor` refuses anything
+  outside it.
+
+  ## Two disjoint maps
+
+  * `supported` -- what the actor may propose. `:escalates?` is a property of
+    the operation, not of the governor's mood, so it lives beside it.
+  * `reserved`  -- operations that name authority belonging exclusively to
+    the mine operator and licensed management. These are *declared* rather
+    than merely absent so the refusal can say why: an undeclared op is a
+    vocabulary error, a reserved op is a professional-authority boundary.
+    Conflating them would let a future edit `supported`-list one of them by
+    accident.")
+
+(def supported
+  "Operations the actor may propose. The value carries the operation's own
+  properties; `:escalates?` true means human sign-off is required regardless
+  of advisor confidence."
+  {:schedule-shift
+   {:escalates? false
+    :summary "shift and crew scheduling for a registered mine-site"}
+
+   :log-production-report
+   {:escalates? false
+    :summary "production data logging (tonnage, grade as reported, hours)"}
+
+   :coordinate-maintenance
+   {:escalates? false
+    :summary "equipment maintenance coordination (work order, window, crew)"}
+
+   :flag-safety-concern
+   {:escalates? true
+    :summary "surface a safety concern for human review"}})
+
+(def reserved
+  "Operations reserved to the mine operator and licensed management. Naming
+  one in a proposal is a permanent hard block, never an escalation:
+  escalation would imply a human could approve the *actor* doing it, and no
+  human can delegate this. These seven are the names the governor's private
+  denylist carried since the repository was scaffolded, each now with the
+  reason the README states."
+  {:extract
+   {:reason "extraction decisions are exclusively operator/management authority"}
+
+   :blast
+   {:reason "blasting decisions (powder, load, timing, sequence) are exclusively operator/management authority"}
+
+   :set-production-target
+   {:reason "production targeting and quota setting are exclusively operator/management authority"}
+
+   :mine-safety-auth
+   {:reason "mine-safety determinations are exclusively operator/management authority"}
+
+   :equipment-sequence
+   {:reason "equipment operation sequencing and authorisation are exclusively operator/management authority"}
+
+   :ventilation-auth
+   {:reason "ventilation adequacy is a mine-safety determination, exclusively operator/management authority"}
+
+   :ore-grade-assess
+   {:reason "ore-grade assessment is a production-targeting decision, exclusively operator/management authority"}})
+
+(defn supported? [op] (contains? supported op))
+(defn reserved? [op] (contains? reserved op))
+
+(defn declared?
+  "True if `op` is named anywhere in this vocabulary. An op that is neither
+  supported nor reserved is undeclared -- the governor refuses it."
+  [op]
+  (or (supported? op) (reserved? op)))
+
+(defn escalates?
+  "True if the operation itself always requires human sign-off. Unsupported
+  ops are never reached by this predicate (the governor hard-blocks first),
+  so a false here is not an admission."
+  [op]
+  (boolean (get-in supported [op :escalates?])))
+
+(defn reserved-reason [op] (get-in reserved [op :reason]))

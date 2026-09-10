@@ -1,0 +1,143 @@
+(ns mining-managers.facts
+  "Well-formedness of the values the ISCO-08 1322 mining manager
+  administrative support actor governs: the manager record, the mine-site
+  record, the request, and the proposal envelope.
+
+  Runtime: portable (pure predicates, no host interop).
+
+  ## Why this namespace exists
+
+  Three measurements on acfd967, all against the shipped governor, all with
+  a registered manager and a registered `:risk-level :medium` site.
+
+  The escalation invariant is a numeric comparison against `:confidence`, but
+  nothing established that `:confidence` was a number in range:
+
+      :confidence 1.5      => ok? true      ; above 1.0, admitted
+      :confidence \"high\"   => ClassCastException thrown from governor/check
+
+  A malformed proposal crashed the governor rather than being refused by it.
+  A governor that throws has not refused -- it has failed to answer, and the
+  caller cannot tell those apart from the stack trace alone.
+
+  Second, the vocabulary check compared `:op` against a set of keywords, so a
+  string op was simply not in the set:
+
+      :op \"schedule-shift\"   => ok? true   ; a string, admitted
+
+  With the allowlist in `mining-managers.operation` a string op is now refused
+  as undeclared, but the reason it is refused should be that it is not a
+  keyword, not that it happens to miss a keyword set. Those are different
+  defects and a ledger reader deserves the right name.
+
+  Third, the governor's own docstring said \"site provenance -- ops must
+  involve a registered mine-site\", but the code only asked when a site was
+  named. A request that named none was admitted:
+
+      request {:manager-id \"m1\"}                      => ok? true, escalate? nil
+      request {:manager-id \"m1\" :site {:site-id \"s-high\"}} => escalate? true
+
+  so the high-risk-site escalation could be bypassed by leaving the site out.
+  Every supported operation here is site-scoped (a shift, a production
+  report, a maintenance window, a safety concern are all *at* a site), so a
+  request without one is malformed, and `request-violations` says so.
+
+  Every function here returns a vector of `{:rule .. :detail ..}` maps --
+  empty means well-formed -- so violations compose with the Governor's own
+  rules without a second shape."
+  (:require [mining-managers.operation :as op]))
+
+(defn manager-record-violations
+  "A registered manager must be a record. The governor already refuses `nil`
+  (unregistered); this refuses a registration that is not a map at all."
+  [manager-record]
+  (cond-> []
+    (not (map? manager-record))
+    (conj {:rule :manager-not-a-record
+           :detail "manager record must be a map"})))
+
+(defn site-record-violations
+  "A registered mine-site must be a record whose `:risk-level` is one the
+  governor can route on. The escalation rule is `(= :high (:risk-level
+  site))`, so anything that is not exactly `:high` reads as safe. Measured
+  on acfd967, `:schedule-shift` at `:confidence 0.95` against a site
+  registered with:
+
+      :risk-level :extreme   => ok? true, escalate? false
+      (no :risk-level)       => ok? true, escalate? false
+      :risk-level \"high\"    => ok? true, escalate? false   ; a string
+
+  A registration the governor cannot read is refused, not read as :low."
+  [site-record]
+  (cond-> []
+    (not (map? site-record))
+    (conj {:rule :site-not-a-record
+           :detail "mine-site record must be a map"})
+
+    (and (map? site-record)
+         (not (contains? #{:low :medium :high} (:risk-level site-record))))
+    (conj {:rule :site-risk-level-undeclared
+           :detail "mine-site :risk-level must be one of :low :medium :high"})))
+
+(defn request-violations
+  "A request must name the manager it is for and the mine-site it is about,
+  and both names must be usable as store keys."
+  [request]
+  (cond-> []
+    (not (map? request))
+    (conj {:rule :request-not-a-map :detail "request must be a map"})
+
+    (and (map? request) (nil? (:manager-id request)))
+    (conj {:rule :request-without-manager-id
+           :detail "request has no :manager-id"})
+
+    (and (map? request) (nil? (get-in request [:site :site-id])))
+    (conj {:rule :request-without-site-id
+           :detail "request has no [:site :site-id]; every supported operation is site-scoped"})))
+
+(defn proposal-violations
+  "The proposal envelope. Payload contents are the domain's business; the
+  envelope is the governor's, because routing decisions are read off it.
+
+  A missing `:confidence` already reads as 0.0 in the governor and thus
+  escalates, which is correct and left alone; a *present but unusable* one is
+  the defect -- it either crashes the comparison or slips past it."
+  [proposal]
+  (cond-> []
+    (not (map? proposal))
+    (conj {:rule :proposal-not-a-map :detail "proposal must be a map"})
+
+    (and (map? proposal) (not (keyword? (:op proposal))))
+    (conj {:rule :proposal-without-op :detail "proposal :op must be a keyword"})
+
+    (and (map? proposal)
+         (contains? proposal :confidence)
+         (some? (:confidence proposal))
+         (not (and (number? (:confidence proposal))
+                   (<= 0 (:confidence proposal) 1))))
+    (conj {:rule :confidence-out-of-range
+           :detail "proposal :confidence must be a number in [0.0, 1.0]"})
+
+    (and (map? proposal)
+         (contains? proposal :payload)
+         (some? (:payload proposal))
+         (not (map? (:payload proposal))))
+    (conj {:rule :payload-not-a-map
+           :detail "proposal :payload, when present, must be a map"})))
+
+(defn vocabulary-violations
+  "The operation must be one this repo declared. Undeclared and reserved are
+  reported as different rules on purpose -- see `mining-managers.operation`.
+  Only asked of a keyword op: a non-keyword has already been reported by
+  `proposal-violations` and would only be reported twice."
+  [proposal]
+  (let [o (:op proposal)]
+    (cond
+      (op/reserved? o)
+      [{:rule :operator-class-blocked :detail (op/reserved-reason o)}]
+
+      (and (keyword? o) (not (op/supported? o)))
+      [{:rule :undeclared-operation
+        :detail (str "operation " o " is not in mining-managers.operation/supported")}]
+
+      :else [])))

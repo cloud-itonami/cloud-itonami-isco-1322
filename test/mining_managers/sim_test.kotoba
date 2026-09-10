@@ -1,0 +1,59 @@
+(ns mining-managers.sim-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [mining-managers.sim :as sim]))
+
+(deftest the-scenario-table-runs-clean-and-demonstrates-refusals
+  (let [r (sim/run)]
+    (is (:ok? r))
+    (is (= (count sim/scenarios) (count (:results r))))
+    (is (pos? (:refusals r)))
+    (is (empty? (:mismatches r)))
+    (is (empty? (:wrote-anyway r)))
+    (is (empty? (:unlogged-escalations r)))
+    (is (empty? (:unmarked-approvals r)))
+    (is (empty? (:overridden-holds r)))
+    (is (empty? (:ledger-breaks r)))))
+
+(deftest every-reserved-and-provenance-scenario-refuses
+  (let [by-name (into {} (map (juxt :name identity) (:results (sim/run))))]
+    (doseq [n [:unregistered-manager :unregistered-site :request-without-site
+               :site-with-unreadable-risk-level :undeclared-operation
+               :reserved-blast :reserved-extract :reserved-production-target
+               :reserved-blast-at-high-risk-site
+               :malformed-confidence-is-refused-not-thrown]]
+      (is (:refusal? (by-name n)) (str n))
+      (is (not (:wrote? (by-name n))) (str n)))))
+
+(deftest the-human-approved-scenario-writes-exactly-once-as-human
+  (let [by-name (into {} (map (juxt :name identity) (:results (sim/run))))]
+    (is (= {:records 1 :approved-by :human}
+           (:approved-write (by-name :safety-concern-approved-by-human))))))
+
+(deftest the-held-scenario-cannot-be-approved
+  (let [by-name (into {} (map (juxt :name identity) (:results (sim/run))))]
+    (is (= {:status :refused :records-after 0 :ledger-grew? false}
+           (:refused-resume (by-name :reserved-blast))))))
+
+(deftest report-refuses-to-report-a-pass-with-no-refusals
+  (testing "the rendering alone: zero refusals is named as a refusal to pass, whatever :ok? says"
+    ;; Built from a real run but with the counters overridden, so this test
+    ;; is about `report` and does not go red for a mismatch elsewhere.
+    (let [r (sim/run)
+          none (assoc r :refusals 0 :ok? false)
+          none-but-ok (assoc r :refusals 0 :ok? true)
+          some-ok (assoc r :refusals 3 :ok? true)
+          some-bad (assoc r :refusals 3 :ok? false)]
+      (is (re-find #"REFUSING TO REPORT A PASS" (sim/report none)))
+      (is (re-find #"REFUSING TO REPORT A PASS" (sim/report none-but-ok))
+          "zero refusals outranks :ok? true")
+      (is (not (re-find #"REFUSING" (sim/report some-ok))))
+      (is (re-find #"\n  PASS\n" (sim/report some-ok)))
+      (is (re-find #"\n  FAIL\n" (sim/report some-bad))))))
+
+(deftest a-table-without-refusing-scenarios-is-not-ok
+  (testing "run over only the clean scenarios must come back :ok? false with refusals 0"
+    (with-redefs [sim/scenarios (filterv #(= :commit (:expect %)) sim/scenarios)]
+      (let [r (sim/run)]
+        (is (zero? (:refusals r)))
+        (is (false? (:ok? r)))
+        (is (empty? (:mismatches r)))))))

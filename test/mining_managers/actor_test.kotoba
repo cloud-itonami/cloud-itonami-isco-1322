@@ -1,34 +1,143 @@
 (ns mining-managers.actor-test
+  "The wired graph, not the pure governor. Every defect measured on acfd967
+  that these tests pin was invisible to governor_test because it only ever
+  showed up once a StateGraph was built and run -- and on acfd967 none was:
+  `run-request!` was a stub that never wrote, and `approve!` marked any map
+  `:committed`."
   (:require [clojure.test :refer [deftest is testing]]
             [mining-managers.actor :as actor]
             [mining-managers.advisor :as advisor]
+            [mining-managers.ledger :as led]
             [mining-managers.store :as store]))
 
-(defn- fresh-store []
-  (let [st (store/mem-store)]
-    (store/register-manager! st {:manager-id "manager-1" :name "Alice Chen" :certifications ["MSHA"] :experience-years 12})
-    (store/register-site! st {:site-id "site-001" :operator-id "operator-1" :location "Nevada" :risk-level :medium})
-    st))
+(def managers {"m-1" {:manager-id "m-1" :name "Alice Chen" :certifications ["MSHA"] :experience-years 12}})
+(def sites {"s-medium" {:site-id "s-medium" :operator-id "op-1" :location "Nevada" :risk-level :medium}
+            "s-high"   {:site-id "s-high" :operator-id "op-1" :location "Nevada" :risk-level :high}})
 
-(deftest graph-build-succeeds
-  (let [st (fresh-store)
-        advisor-fn (advisor/mock-advisor)
-        store-fn (fn [] st)
-        graph (actor/build-graph advisor-fn store-fn)]
-    (is (contains? graph :nodes))
-    (is (contains? graph :edges))
-    (is (contains? graph :start-node))))
+(defn- run [request thread]
+  (let [st (store/mem-store {:managers managers :mine-sites sites})
+        g (actor/build-graph {:store st})
+        r (actor/run-request! g request nil thread)]
+    {:store st :graph g :result r :state (:state r)}))
 
-(deftest run-request-accepts-clean-proposal
-  (let [st (fresh-store)
-        adv (advisor/mock-advisor)
-        request {:manager-id "manager-1" :op :schedule-shift :stake :low}
-        state (actor/run-request! {:advisor adv} request {} st)]
-    (is (contains? state :proposal))
-    (is (contains? state :verdict))))
+(deftest an-automatic-write-is-recorded-and-marked-as-the-actors
+  (testing "measured on acfd967: a clean request stopped at :ready-to-commit with 0 records"
+    (let [{:keys [store state result]} (run {:manager-id "m-1" :site {:site-id "s-medium"}
+                                             :op :schedule-shift :stake :low} "t-auto")]
+      (is (= :done (:status result)))
+      (is (= :commit (:disposition state)))
+      (is (= 1 (count (store/records store))))
+      (is (= {:manager-id "m-1" :site-id "s-medium" :op :schedule-shift}
+             (dissoc (first (store/records store)) :payload)))
+      (is (= [:commit] (mapv :disposition (store/ledger store))))
+      (is (= :actor (:approved-by (peek (store/ledger store))))))))
 
-(deftest approve-marks-state-as-committed
-  (let [state {:outcome :waiting-approval}
-        approved (actor/approve! state)]
-    (is (= :committed (:outcome approved)))
-    (is (contains? approved :approval-timestamp))))
+(deftest an-undeclared-operation-is-held-and-never-written
+  (testing "measured on acfd967: :authorize-blast / :detonate / :override-ventilation were ok? true"
+    (doseq [[op thread] [[:authorize-blast "t-u1"] [:detonate "t-u2"] [:override-ventilation "t-u3"]]]
+      (let [{:keys [store state result]} (run {:manager-id "m-1" :site {:site-id "s-medium"} :op op} thread)]
+        (is (= :done (:status result)) (str op))
+        (is (= :hold (:disposition state)) (str op))
+        (is (= 0 (count (store/records store))) (str op))
+        (is (= [:hold] (mapv :disposition (store/ledger store))) (str op))
+        (is (= [:undeclared-operation]
+               (mapv :rule (get-in (first (store/ledger store)) [:verdict :violations])))
+            (str op))))))
+
+(deftest a-reserved-operation-is-held-for-the-reason-the-readme-states
+  (let [{:keys [store state]} (run {:manager-id "m-1" :site {:site-id "s-medium"} :op :blast} "t-reserved")]
+    (is (= :hold (:disposition state)))
+    (is (= 0 (count (store/records store))))
+    (is (= [:operator-class-blocked]
+           (mapv :rule (get-in (first (store/ledger store)) [:verdict :violations]))))
+    (is (re-find #"blasting" (get-in (first (store/ledger store)) [:verdict :violations 0 :detail])))))
+
+(deftest a-request-without-a-site-is-held
+  (testing "measured on acfd967: {:manager-id ..} with no :site was ok? true, escalate? nil"
+    (let [{:keys [store state]} (run {:manager-id "m-1" :op :schedule-shift :stake :low} "t-nosite")]
+      (is (= :hold (:disposition state)))
+      (is (= 0 (count (store/records store))))
+      (is (= [:request-without-site-id]
+             (mapv :rule (get-in (first (store/ledger store)) [:verdict :violations])))))))
+
+(deftest an-escalation-is-in-the-ledger-before-anyone-approves-it
+  (testing "measured on acfd967: the ledger was [] while the thread waited"
+    (let [{:keys [store state result]} (run {:manager-id "m-1" :site {:site-id "s-medium"}
+                                             :op :flag-safety-concern :stake :high} "t-escalate")]
+      (is (= :interrupted (:status result)))
+      (is (= :request-approval (:disposition state)))
+      (is (= 0 (count (store/records store))))
+      (is (= [:escalate] (mapv :disposition (store/ledger store))))
+      (let [e (first (store/ledger store))]
+        (is (= :pending (:approved-by e)))
+        (is (= :flag-safety-concern (:op e)))
+        (is (= "m-1" (:manager-id e)))
+        (is (= "s-medium" (:site-id e)))))))
+
+(deftest a-high-risk-site-escalates-through-the-graph
+  (let [{:keys [store state result]} (run {:manager-id "m-1" :site {:site-id "s-high"}
+                                           :op :schedule-shift :stake :low} "t-high")]
+    (is (= :interrupted (:status result)))
+    (is (= :request-approval (:disposition state)))
+    (is (= 0 (count (store/records store))))
+    (is (= [:escalate] (mapv :disposition (store/ledger store))))))
+
+(deftest a-reserved-op-at-a-high-risk-site-is-held-not-escalated
+  (testing "hard outranks escalate through the graph: no human is asked to approve a blast"
+    (let [{:keys [store state result]} (run {:manager-id "m-1" :site {:site-id "s-high"} :op :blast} "t-hard-high")]
+      (is (= :done (:status result)))
+      (is (= :hold (:disposition state)))
+      (is (= 0 (count (store/records store))))
+      (is (= [:hold] (mapv :disposition (store/ledger store)))))))
+
+(deftest a-human-approved-write-says-so
+  (testing "measured on acfd967: approve! wrote nothing, so approved and automatic writes could not differ"
+    (let [{:keys [store graph]} (run {:manager-id "m-1" :site {:site-id "s-medium"}
+                                      :op :flag-safety-concern :stake :high} "t-approve")
+          r2 (actor/approve! graph "t-approve")]
+      (is (= :done (:status r2)))
+      (is (= 1 (count (store/records store))))
+      (is (= [:escalate :commit] (mapv :disposition (store/ledger store))))
+      (is (= :human (:approved-by (peek (store/ledger store)))))
+      (is (:ok? (led/verify (store/ledger store)))))))
+
+(deftest approving-a-held-thread-is-refused-and-writes-nothing
+  (testing "measured on acfd967: approve! on {:outcome :held ..} returned :committed"
+    (let [{:keys [store graph]} (run {:manager-id "m-1" :site {:site-id "s-medium"} :op :blast} "t-held")
+          before (store/ledger store)
+          r2 (actor/approve! graph "t-held")]
+      (is (= :refused (:status r2)))
+      (is (= :thread-not-interrupted (:reason r2)))
+      (is (= :done (:checkpoint-status r2)))
+      (is (= 0 (count (store/records store))))
+      (is (= before (store/ledger store)) "a refused resume must not extend the ledger"))))
+
+(deftest approving-an-unknown-thread-is-refused
+  (let [st (store/mem-store {:managers managers :mine-sites sites})
+        g (actor/build-graph {:store st})
+        r (actor/approve! g "never-ran")]
+    (is (= :refused (:status r)))
+    (is (= :no-such-thread (:reason r)))
+    (is (= 0 (count (store/records st))))
+    (is (= [] (store/ledger st)))))
+
+(deftest a-malformed-proposal-is-refused-not-thrown
+  (testing "measured on acfd967: a string :confidence threw ClassCastException out of :govern"
+    (let [st (store/mem-store {:managers managers :mine-sites sites})
+          adv (reify advisor/Advisor
+                (-advise [_ _ request]
+                  {:op (:op request) :confidence "high" :effect :propose}))
+          g (actor/build-graph {:store st :advisor adv})
+          r (actor/run-request! g {:manager-id "m-1" :site {:site-id "s-medium"} :op :schedule-shift} nil "t-malformed")]
+      (is (= :done (:status r)))
+      (is (= :hold (:disposition (:state r))))
+      (is (= 0 (count (store/records st))))
+      (is (= [:confidence-out-of-range]
+             (mapv :rule (get-in (first (store/ledger st)) [:verdict :violations])))))))
+
+(deftest every-ledger-the-graph-leaves-behind-verifies
+  (doseq [[op site thread] [[:schedule-shift "s-medium" "v-1"] [:blast "s-medium" "v-2"]
+                            [:override-ventilation "s-medium" "v-3"] [:flag-safety-concern "s-medium" "v-4"]
+                            [:schedule-shift "s-high" "v-5"] [:schedule-shift "no-such" "v-6"]]]
+    (let [{:keys [store]} (run {:manager-id "m-1" :site {:site-id site} :op op} thread)]
+      (is (:ok? (led/verify (store/ledger store))) (str op " @ " site)))))

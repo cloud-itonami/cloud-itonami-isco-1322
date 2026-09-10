@@ -1,0 +1,67 @@
+(ns mining-managers.facts-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [mining-managers.facts :as facts]))
+
+(deftest a-well-formed-request-has-no-violations
+  (is (= [] (facts/request-violations {:manager-id "m" :site {:site-id "s"}}))))
+
+(deftest a-request-must-name-manager-and-site
+  (is (= [:request-without-manager-id :request-without-site-id]
+         (mapv :rule (facts/request-violations {}))))
+  (is (= [:request-without-site-id]
+         (mapv :rule (facts/request-violations {:manager-id "m"}))))
+  (is (= [:request-without-site-id]
+         (mapv :rule (facts/request-violations {:manager-id "m" :site {}}))))
+  (is (= [:request-without-manager-id]
+         (mapv :rule (facts/request-violations {:site {:site-id "s"}}))))
+  (is (= [:request-not-a-map] (mapv :rule (facts/request-violations "m")))))
+
+(deftest a-well-formed-proposal-has-no-violations
+  (is (= [] (facts/proposal-violations {:op :schedule-shift :effect :propose :confidence 0.9})))
+  (is (= [] (facts/proposal-violations {:op :schedule-shift :effect :propose}))
+      "a missing confidence is legitimate; the governor reads it as 0.0"))
+
+(deftest confidence-must-be-a-number-in-range
+  (testing "the boundary values are inside"
+    (is (= [] (facts/proposal-violations {:op :x :confidence 0})))
+    (is (= [] (facts/proposal-violations {:op :x :confidence 1})))
+    (is (= [] (facts/proposal-violations {:op :x :confidence 0.0})))
+    (is (= [] (facts/proposal-violations {:op :x :confidence 1.0}))))
+  (testing "just outside, and the wrong type"
+    (doseq [c [1.5 1.0000001 -0.1 "high" :high [0.9]]]
+      (is (= [:confidence-out-of-range] (mapv :rule (facts/proposal-violations {:op :x :confidence c})))
+          (pr-str c)))))
+
+(deftest op-must-be-a-keyword
+  (doseq [o ["schedule-shift" 'schedule-shift nil 1]]
+    (is (= [:proposal-without-op] (mapv :rule (facts/proposal-violations {:op o})))
+        (pr-str o))))
+
+(deftest payload-when-present-must-be-a-map
+  (is (= [] (facts/proposal-violations {:op :x :payload {:a 1}})))
+  (is (= [] (facts/proposal-violations {:op :x :payload nil})))
+  (is (= [:payload-not-a-map] (mapv :rule (facts/proposal-violations {:op :x :payload [1 2]})))))
+
+(deftest a-proposal-that-is-not-a-map-is-one-violation
+  (is (= [:proposal-not-a-map] (mapv :rule (facts/proposal-violations nil))))
+  (is (= [:proposal-not-a-map] (mapv :rule (facts/proposal-violations "propose")))))
+
+(deftest vocabulary-names-reserved-and-undeclared-differently
+  (is (= [:operator-class-blocked] (mapv :rule (facts/vocabulary-violations {:op :blast}))))
+  (is (= [:undeclared-operation] (mapv :rule (facts/vocabulary-violations {:op :authorize-blast}))))
+  (is (= [] (facts/vocabulary-violations {:op :schedule-shift})))
+  (is (= [] (facts/vocabulary-violations {:op "schedule-shift"}))
+      "a non-keyword op is proposal-violations' finding, not reported twice"))
+
+(deftest site-record-must-carry-a-readable-risk-level
+  (is (= [] (facts/site-record-violations {:site-id "s" :risk-level :low})))
+  (is (= [] (facts/site-record-violations {:site-id "s" :risk-level :medium})))
+  (is (= [] (facts/site-record-violations {:site-id "s" :risk-level :high})))
+  (is (= [:site-risk-level-undeclared] (mapv :rule (facts/site-record-violations {:site-id "s" :risk-level :extreme}))))
+  (is (= [:site-risk-level-undeclared] (mapv :rule (facts/site-record-violations {:site-id "s"}))))
+  (is (= [:site-risk-level-undeclared] (mapv :rule (facts/site-record-violations {:site-id "s" :risk-level "high"}))))
+  (is (= [:site-not-a-record] (mapv :rule (facts/site-record-violations "s")))))
+
+(deftest manager-record-must-be-a-map
+  (is (= [] (facts/manager-record-violations {:manager-id "m"})))
+  (is (= [:manager-not-a-record] (mapv :rule (facts/manager-record-violations "m")))))

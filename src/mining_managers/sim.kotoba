@@ -1,0 +1,297 @@
+(ns mining-managers.sim
+  "Deterministic governed-scenario harness for the ISCO-08 1322 mining
+  manager administrative support actor: run a table of requests through the
+  real StateGraph and report which ones the governor refused.
+
+  Runtime: `run` and `report` are portable. `-main` is `:clj`-only, because
+  process exit codes are a host concern; the `:cljs` branch throws rather than
+  pretending to exit.
+
+  ## Why this namespace exists, and why it fails loudly
+
+  A governed actor's claim is not that it acts -- it is that there exist
+  actions it refuses. A harness that ran only clean scenarios would print
+  green while demonstrating nothing, which is the shape this workspace has
+  repeatedly caught: a check that could not fail returning the same value as a
+  check that ran and passed.
+
+  So `run` counts refusals, and `-main` exits non-zero when the count is zero.
+  A scenario table that has stopped exercising the governor is a defect in the
+  table, and it is reported as one rather than as a pass.
+
+  ## The five questions this answers that a unit test does not
+
+    * does the *wired graph* refuse, or only the pure `check` function
+    * does an escalated request actually interrupt rather than write, and
+      does it leave an `:escalate` entry in the ledger while it waits
+    * when a human resumes it, is the write recorded as human-approved
+    * when a human tries to resume a HELD thread, is nothing written
+    * does the ledger it leaves behind verify"
+  (:require [mining-managers.actor :as actor]
+            [mining-managers.advisor :as advisor]
+            [mining-managers.ledger :as led]
+            [mining-managers.phase :as phase]
+            [mining-managers.store :as store]))
+
+(def registered-managers
+  {"sim-manager-1" {:manager-id "sim-manager-1" :name "Sim Manager"
+                    :certifications ["MSHA"] :experience-years 9}})
+
+(def registered-sites
+  {"sim-site-medium" {:site-id "sim-site-medium" :operator-id "sim-op"
+                      :location "Sim Basin" :risk-level :medium}
+   "sim-site-high"   {:site-id "sim-site-high" :operator-id "sim-op"
+                      :location "Sim Ridge" :risk-level :high}
+   "sim-site-unread" {:site-id "sim-site-unread" :operator-id "sim-op"
+                      :location "Sim Flat" :risk-level :extreme}})
+
+(defn- fixed-advisor
+  "An advisor that returns `proposal` whatever the request. Stands in for an
+  LLM that answered badly: too little confidence, or an envelope the
+  governor cannot read. The mock advisor derives its confidence from
+  `:stake` and never goes below the floor, so these paths need their own."
+  [proposal]
+  (reify advisor/Advisor
+    (-advise [_ _store _request] proposal)))
+
+(def scenarios
+  "Each scenario names the phase it must reach. `:expect` is asserted, not
+  merely printed -- a scenario whose actual phase differs is a mismatch and
+  fails the run, so this table is a specification and not a log.
+
+  `:then-approve? true` resumes the thread as a human would. On an escalated
+  scenario it asserts the resulting write is recorded as `:approved-by
+  :human`; on a held scenario it asserts the resume is REFUSED and writes
+  nothing -- the README's 'no override path', demonstrated rather than
+  stated."
+  [{:name :clean-shift-schedule
+    :request {:manager-id "sim-manager-1" :site {:site-id "sim-site-medium"}
+              :op :schedule-shift :stake :low}
+    :expect :commit
+    :why "declared op, registered manager and medium-risk site, confidence above floor"}
+
+   {:name :clean-production-report
+    :request {:manager-id "sim-manager-1" :site {:site-id "sim-site-medium"}
+              :op :log-production-report :stake :medium}
+    :expect :commit
+    :why "declared op, confidence above floor"}
+
+   {:name :clean-maintenance-coordination
+    :request {:manager-id "sim-manager-1" :site {:site-id "sim-site-medium"}
+              :op :coordinate-maintenance :stake :low}
+    :expect :commit
+    :why "declared op, confidence above floor"}
+
+   {:name :unregistered-manager
+    :request {:manager-id "no-such-manager" :site {:site-id "sim-site-medium"}
+              :op :schedule-shift}
+    :expect :hold
+    :why "provenance: the manager was never registered"}
+
+   {:name :unregistered-site
+    :request {:manager-id "sim-manager-1" :site {:site-id "no-such-site"}
+              :op :schedule-shift}
+    :expect :hold
+    :why "provenance: the mine-site was never registered"}
+
+   {:name :request-without-site
+    :request {:manager-id "sim-manager-1" :op :schedule-shift}
+    :expect :hold
+    :why "provenance: the request names no site (was admitted on acfd967)"}
+
+   {:name :site-with-unreadable-risk-level
+    :request {:manager-id "sim-manager-1" :site {:site-id "sim-site-unread"}
+              :op :schedule-shift}
+    :expect :hold
+    :why "provenance: the site's :risk-level is not one the governor routes on"}
+
+   {:name :undeclared-operation
+    :request {:manager-id "sim-manager-1" :site {:site-id "sim-site-medium"}
+              :op :override-ventilation}
+    :expect :hold
+    :why "vocabulary: op is not in mining-managers.operation/supported"}
+
+   {:name :reserved-blast
+    :request {:manager-id "sim-manager-1" :site {:site-id "sim-site-medium"}
+              :op :blast}
+    :expect :hold
+    :then-approve? true
+    :why "authority: blasting is the operator's; a human resume must be refused"}
+
+   {:name :reserved-extract
+    :request {:manager-id "sim-manager-1" :site {:site-id "sim-site-medium"}
+              :op :extract}
+    :expect :hold
+    :why "authority: extraction is the operator's"}
+
+   {:name :reserved-production-target
+    :request {:manager-id "sim-manager-1" :site {:site-id "sim-site-medium"}
+              :op :set-production-target}
+    :expect :hold
+    :why "authority: production targeting is management's"}
+
+   {:name :reserved-blast-at-high-risk-site
+    :request {:manager-id "sim-manager-1" :site {:site-id "sim-site-high"}
+              :op :blast}
+    :expect :hold
+    :why "hard outranks escalate: a blast at a :high site is held, not put to a human"}
+
+   {:name :low-confidence-escalates
+    :request {:manager-id "sim-manager-1" :site {:site-id "sim-site-medium"}
+              :op :log-production-report}
+    :advisor (fixed-advisor {:op :log-production-report :effect :propose :confidence 0.2
+                             :rationale "sim: an uncertain advisor"})
+    :expect :request-approval
+    :why "confidence below the floor always asks a human"}
+
+   {:name :malformed-confidence-is-refused-not-thrown
+    :request {:manager-id "sim-manager-1" :site {:site-id "sim-site-medium"}
+              :op :schedule-shift}
+    :advisor (fixed-advisor {:op :schedule-shift :effect :propose :confidence "high"})
+    :expect :hold
+    :why "envelope: a string confidence threw ClassCastException out of check on acfd967"}
+
+   {:name :high-risk-site-escalates
+    :request {:manager-id "sim-manager-1" :site {:site-id "sim-site-high"}
+              :op :schedule-shift :stake :low}
+    :expect :request-approval
+    :why "any operation at a :high site requires human sign-off"}
+
+   {:name :safety-concern-escalates
+    :request {:manager-id "sim-manager-1" :site {:site-id "sim-site-medium"}
+              :op :flag-safety-concern :stake :high}
+    :expect :request-approval
+    :why "the operation itself always requires human sign-off"}
+
+   {:name :safety-concern-approved-by-human
+    :request {:manager-id "sim-manager-1" :site {:site-id "sim-site-medium"}
+              :op :flag-safety-concern :stake :high}
+    :expect :request-approval
+    :then-approve? true
+    :why "resumed by a human, the write must say so"}])
+
+(defn- run-one [scenario]
+  (let [st (store/mem-store {:managers registered-managers :mine-sites registered-sites})
+        graph (actor/build-graph (cond-> {:store st}
+                                   (:advisor scenario) (assoc :advisor (:advisor scenario))))
+        thread (str "sim-" (name (:name scenario)))
+        result (actor/run-request! graph (:request scenario) {} thread)
+        state (:state result)
+        actual (or (:disposition state)
+                   ;; A run that never reached :decide produced no phase at
+                   ;; all; report that rather than defaulting it to a phase,
+                   ;; which would make an unrun scenario look like a verdict.
+                   :no-phase)
+        escalated? (= actual :request-approval)
+        records-before-approval (count (store/records st))
+        ledger-before-approval (store/ledger st)
+        resumed (when (:then-approve? scenario)
+                  (actor/approve! graph thread))
+        ledger (store/ledger st)]
+    {:name (:name scenario)
+     :expect (:expect scenario)
+     :actual actual
+     :why (:why scenario)
+     :status (:status result)
+     :match? (= actual (:expect scenario))
+     :refusal? (and (not= actual :no-phase) (phase/refusal? actual))
+     ;; Counted at the moment the graph stopped, before any human resumed it:
+     ;; a refusal is a refusal of the proposal as submitted.
+     :wrote? (pos? records-before-approval)
+     :escalate-logged? (boolean (some #(= :escalate (:disposition %)) ledger-before-approval))
+     :approved-write (when (and resumed escalated?)
+                       {:records (count (store/records st))
+                        :approved-by (:approved-by (peek ledger))})
+     :refused-resume (when (and resumed (not escalated?))
+                       {:status (:status resumed)
+                        :records-after (count (store/records st))
+                        :ledger-grew? (> (count ledger) (count ledger-before-approval))})
+     :ledger-verify (led/verify ledger)}))
+
+(defn run
+  "Run every scenario. Returns
+  `{:results [..] :refusals n :mismatches [..] :ok? bool ..}`.
+
+  `:ok?` requires all of: every scenario reached its expected phase, no
+  refusal wrote anything, every escalation was in the ledger before the
+  interrupt, every human-approved resume wrote exactly one record marked
+  `:approved-by :human`, every resume of a non-escalated thread was refused
+  and wrote nothing, every ledger left behind verifies, and at least one
+  refusal was demonstrated."
+  []
+  (let [results (mapv run-one scenarios)
+        refusals (count (filter :refusal? results))
+        mismatches (filterv (complement :match?) results)
+        ;; A refusal that still wrote a record is the worst outcome available
+        ;; and would otherwise hide inside a matching phase.
+        wrote-anyway (filterv #(and (:refusal? %) (:wrote? %)) results)
+        unlogged-escalations (filterv #(and (= :request-approval (:actual %))
+                                            (not (:escalate-logged? %)))
+                                      results)
+        unmarked-approvals (filterv #(and (:approved-write %)
+                                          (not= {:records 1 :approved-by :human}
+                                                (:approved-write %)))
+                                    results)
+        overridden-holds (filterv #(and (:refused-resume %)
+                                        (not= {:status :refused :records-after 0 :ledger-grew? false}
+                                              (:refused-resume %)))
+                                  results)
+        ledger-breaks (filterv #(not (:ok? (:ledger-verify %))) results)]
+    {:results results
+     :refusals refusals
+     :mismatches mismatches
+     :wrote-anyway wrote-anyway
+     :unlogged-escalations unlogged-escalations
+     :unmarked-approvals unmarked-approvals
+     :overridden-holds overridden-holds
+     :ledger-breaks ledger-breaks
+     :ok? (and (empty? mismatches)
+               (empty? wrote-anyway)
+               (empty? unlogged-escalations)
+               (empty? unmarked-approvals)
+               (empty? overridden-holds)
+               (empty? ledger-breaks)
+               (pos? refusals))}))
+
+(defn report
+  "Human-readable run report. Pure: takes the result of `run`."
+  [{:keys [results refusals mismatches wrote-anyway unlogged-escalations
+           unmarked-approvals overridden-holds ledger-breaks ok?]}]
+  (str
+   "mining-managers.sim — governed scenario run\n"
+   (apply str
+          (for [r results]
+            (str "  " (if (:match? r) "ok  " "BAD ")
+                 (name (:name r))
+                 " expect=" (name (:expect r))
+                 " actual=" (name (:actual r))
+                 (when (:refusal? r) " [refused]")
+                 (when (:approved-write r)
+                   (str " [approved-by=" (name (or (:approved-by (:approved-write r)) :unrecorded)) "]"))
+                 (when (:refused-resume r)
+                   (str " [resume=" (name (or (:status (:refused-resume r)) :unrecorded)) "]"))
+                 "\n")))
+   "  scenarios=" (count results)
+   " refusals=" refusals
+   " mismatches=" (count mismatches)
+   " wrote-anyway=" (count wrote-anyway)
+   " unlogged-escalations=" (count unlogged-escalations)
+   " unmarked-approvals=" (count unmarked-approvals)
+   " overridden-holds=" (count overridden-holds)
+   " ledger-breaks=" (count ledger-breaks)
+   "\n"
+   (cond
+     (zero? refusals)
+     "  REFUSING TO REPORT A PASS: the scenario table demonstrated no refusal.\n"
+     ok? "  PASS\n"
+     :else "  FAIL\n")))
+
+#?(:clj
+   (defn -main [& _]
+     (let [r (run)]
+       (print (report r))
+       (flush)
+       (System/exit (if (:ok? r) 0 1))))
+   :cljs
+   (defn -main [& _]
+     (throw (ex-info "mining-managers.sim/-main is :clj-only (process exit codes are a host concern); call `run` and inspect the result instead" {}))))

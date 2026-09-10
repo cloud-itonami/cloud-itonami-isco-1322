@@ -1,0 +1,167 @@
+(ns mining-managers.ledger
+  "Append-only audit ledger for the ISCO-08 1322 mining manager
+  administrative support actor: entry construction, hash chaining, and
+  verification.
+
+  Runtime: portable. The chain hash is a pure polynomial over the entry's
+  printed form, chosen so that both Clojure and ClojureScript compute the
+  *same* number: intermediate values stay below 2^36, well inside the
+  exactly-representable integer range of a double, so no host-specific 32-bit
+  wrap or BigInt is involved. `hash` from clojure.core was not used because it
+  is explicitly not stable across runtimes.
+
+  ## Why this namespace exists
+
+  The store held an `:audit-log` vector and the README called it append-only,
+  but nothing in the value made a dropped or reordered entry detectable, and
+  on acfd967 nothing ever reached it: `run-request!` stopped at
+  `:ready-to-commit` without writing, an escalation wrote nothing while it
+  waited, and `approve!` wrote nothing when the wait ended. Measured through
+  the shipped actor, a clean request, a safety concern, and its approval:
+
+      clean request   outcome=:ready-to-commit   audit-log count=0
+      safety-concern  outcome=:escalated         audit-log count=0
+      after approve!  outcome=:committed         audit-log count=0
+
+  Had anything been written, each entry would have carried a host timestamp
+  (`java.time.Instant/now`) and nothing else identifying its position:
+  no sequence number, no link to the entry before it. Any prefix of that
+  ledger, and any permutation of it, would be indistinguishable from the
+  real thing. 'Append-only' was a property of the code path, not of the
+  artifact -- and the code path is exactly what an audit is trying to check.
+
+  ## What verify does not claim
+
+  A truncated ledger verifies as intact -- a chain cannot detect entries it
+  never saw. That is a real limit, not an oversight: detecting truncation
+  needs an external anchor (a signed head), which this in-memory store does
+  not have. `verify` claims only what it can show, and names which check
+  failed rather than returning a bare false."
+  (:require [clojure.string :as str]
+            [clojure.walk :as walk]))
+
+(def ^:private modulus 2147483647)
+
+(defn canonical
+  "`content` with every map, at every depth, in a total key order, so that
+  `pr-str` of it is a function of the value and not of the map's history.
+
+  Learned from cloud-itonami-isco-3133 (2026-09-11) while wiring its
+  escalate-entry: an entry of nine keys is a hash-map, and
+  `(dissoc e :ledger/hash)` of a hash-map stays a hash-map, whose print order
+  is not the insertion order the eight-key array-map had at construction.
+  The chain hashed one order and verified against the other, so every ledger
+  holding an escalation failed `verify` with :hash-mismatch -- the check
+  refused an intact ledger. Eight keys is the array-map ceiling and the
+  boundary this bites on; `ledger-test` keeps an entry with nine, and this
+  actor's `escalate-entry` has ten.
+
+  Keys are ordered by their printed form rather than by `compare`, because a
+  payload map may mix key types and `compare` throws across them."
+  [content]
+  (walk/postwalk
+   (fn [x]
+     (if (map? x)
+       (into (sorted-map-by (fn [a b] (compare (pr-str a) (pr-str b)))) x)
+       x))
+   content))
+
+(defn- code-point-at [s i]
+  #?(:clj  (int (.charAt ^String s i))
+     :cljs (.charCodeAt s i)))
+
+(defn chain-hash
+  "H(prev, content) as an integer in [0, modulus). Deterministic and identical
+  under Clojure and ClojureScript."
+  [prev content]
+  (let [s (pr-str (canonical content))
+        n (count s)]
+    (loop [i 0
+           h (mod (+ 1469598103 prev) modulus)]
+      (if (>= i n)
+        h
+        (recur (inc i)
+               (mod (+ (* h 31) (code-point-at s i)) modulus))))))
+
+(defn entry
+  "Build the next chained entry for `ledger` (a vector of entries) from the
+  plain map `m`. Adds `:ledger/seq`, `:ledger/prev` and `:ledger/hash`.
+
+  The hash covers `m` and the previous hash, so it commits to both the entry's
+  content and its position."
+  [ledger m]
+  (let [prev (if (seq ledger) (:ledger/hash (peek ledger)) 0)
+        seq-n (count ledger)
+        body (assoc m :ledger/seq seq-n :ledger/prev prev)]
+    (assoc body :ledger/hash (chain-hash prev (dissoc body :ledger/hash)))))
+
+(defn append
+  "Pure append: ledger vector -> ledger vector. This is the only way an entry
+  should enter the ledger, because it is where the chain is extended."
+  [ledger m]
+  (conj (vec ledger) (entry ledger m)))
+
+(defn verify
+  "Recompute the chain. Returns `{:ok? bool :length n :broken-at i :reason kw}`."
+  [ledger]
+  (loop [i 0 prev 0]
+    (if (>= i (count ledger))
+      {:ok? true :length (count ledger)}
+      (let [e (nth ledger i)]
+        (cond
+          (not= (:ledger/seq e) i)
+          {:ok? false :length (count ledger) :broken-at i :reason :seq-mismatch}
+
+          (not= (:ledger/prev e) prev)
+          {:ok? false :length (count ledger) :broken-at i :reason :prev-mismatch}
+
+          (not= (:ledger/hash e)
+                (chain-hash prev (dissoc e :ledger/hash)))
+          {:ok? false :length (count ledger) :broken-at i :reason :hash-mismatch}
+
+          :else
+          (recur (inc i) (:ledger/hash e)))))))
+
+(defn commit-entry
+  "Ledger entry for a write. `approved-by` is `:human` when the write was
+  reached by a human resuming an escalated thread, `:actor` when the governor
+  admitted it without escalation. Recording `:actor` explicitly rather than
+  omitting the key keeps the two cases the same shape, so a reader cannot
+  mistake an absent field for an unaudited one."
+  [record approved-by]
+  {:disposition :commit
+   :phase :commit
+   :approved-by approved-by
+   :record record})
+
+(defn hold-entry
+  "Ledger entry for a refusal. Carries the violations so the ledger explains
+  the refusal without needing the run that produced it."
+  [verdict]
+  {:disposition :hold
+   :phase :hold
+   :approved-by :none
+   :verdict verdict})
+
+(defn escalate-entry
+  "Ledger entry written the moment a proposal is routed to a human, BEFORE
+  the graph interrupts. It carries the proposal so an escalation that is
+  never approved still explains itself; `:approved-by :pending` says the
+  question is open, not that nobody was asked."
+  [request proposal verdict]
+  {:disposition :escalate
+   :phase :request-approval
+   :approved-by :pending
+   :manager-id (:manager-id request)
+   :site-id (get-in request [:site :site-id])
+   :op (:op proposal)
+   :confidence (:confidence verdict)})
+
+(defn summary
+  "One line per entry, for operators and for `mining-managers.sim` output."
+  [ledger]
+  (str/join "\n"
+            (for [e ledger]
+              (str (:ledger/seq e) " " (name (:disposition e))
+                   " approved-by=" (name (or (:approved-by e) :unrecorded))
+                   " hash=" (:ledger/hash e)))))

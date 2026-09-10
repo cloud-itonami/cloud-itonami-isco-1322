@@ -1,4 +1,9 @@
 (ns mining-managers.governor-test
+  "The pure `check`. The first nine tests are the suite as it stood at
+  18aeef6 (12 tests / 34 assertions with actor_test), kept as containment
+  controls with one change: every clean request now names a site, because a
+  request without one is refused (see `mining-managers.facts`). The rest pin
+  the defects measured on acfd967."
   (:require [clojure.test :refer [deftest is testing]]
             [mining-managers.governor :as governor]
             [mining-managers.store :as store]))
@@ -7,88 +12,154 @@
   (let [st (store/mem-store)]
     (store/register-manager! st {:manager-id "manager-1" :name "Alice Chen" :certifications ["MSHA" "PMP"] :experience-years 12})
     (store/register-site! st {:site-id "site-001" :operator-id "operator-1" :location "Nevada" :risk-level :medium})
+    (store/register-site! st {:site-id "site-high-risk" :operator-id "operator-1" :location "Nevada" :risk-level :high})
     st))
 
+(def clean-request {:manager-id "manager-1" :site {:site-id "site-001"}})
+
+(defn- check [request proposal]
+  (governor/check request {} proposal (fresh-store)))
+
 (deftest accepts-clean-low-stake-proposal
-  (let [st (fresh-store)
-        request {:manager-id "manager-1"}
-        proposal {:op :schedule-shift :effect :propose :confidence 0.95}
-        verdict (governor/check request {} proposal st)]
+  (let [verdict (check clean-request {:op :schedule-shift :effect :propose :confidence 0.95})]
     (is (:ok? verdict))
     (is (not (:hard? verdict)))
-    (is (not (:escalate? verdict)))))
+    (is (not (:escalate? verdict)))
+    (is (= [] (:violations verdict)))))
 
 (deftest hard-blocks-unregistered-manager
-  (let [st (fresh-store)
-        request {:manager-id "no-such-manager"}
-        proposal {:op :schedule-shift :effect :propose :confidence 0.95}
-        verdict (governor/check request {} proposal st)]
+  (let [verdict (check {:manager-id "no-such-manager" :site {:site-id "site-001"}}
+                       {:op :schedule-shift :effect :propose :confidence 0.95})]
     (is (not (:ok? verdict)))
     (is (:hard? verdict))
-    (is (seq (:violations verdict)))))
+    (is (= [:no-manager] (mapv :rule (:violations verdict))))))
 
 (deftest hard-blocks-extraction-operation
-  (let [st (fresh-store)
-        request {:manager-id "manager-1"}
-        proposal {:op :extract :effect :propose :confidence 0.95}
-        verdict (governor/check request {} proposal st)]
+  (let [verdict (check clean-request {:op :extract :effect :propose :confidence 0.95})]
     (is (not (:ok? verdict)))
     (is (:hard? verdict))
-    (is (seq (:violations verdict)))))
+    (is (= [:operator-class-blocked] (mapv :rule (:violations verdict))))))
 
 (deftest hard-blocks-production-targeting
-  (let [st (fresh-store)
-        request {:manager-id "manager-1"}
-        proposal {:op :set-production-target :effect :propose :confidence 0.95}
-        verdict (governor/check request {} proposal st)]
+  (let [verdict (check clean-request {:op :set-production-target :effect :propose :confidence 0.95})]
     (is (not (:ok? verdict)))
     (is (:hard? verdict))
-    (is (seq (:violations verdict)))))
+    (is (= [:operator-class-blocked] (mapv :rule (:violations verdict))))))
 
 (deftest escalates-safety-concern
-  (let [st (fresh-store)
-        request {:manager-id "manager-1"}
-        proposal {:op :flag-safety-concern :effect :propose :confidence 0.95}
-        verdict (governor/check request {} proposal st)]
+  (let [verdict (check clean-request {:op :flag-safety-concern :effect :propose :confidence 0.95})]
     (is (not (:ok? verdict)))
     (is (not (:hard? verdict)))
-    (is (:escalate? verdict))))
+    (is (true? (:escalate? verdict)))))
 
 (deftest escalates-high-risk-site-operation
-  (let [st (store/mem-store)
-        _ (store/register-manager! st {:manager-id "manager-1" :name "Alice Chen" :certifications ["MSHA"] :experience-years 12})
-        _ (store/register-site! st {:site-id "site-high-risk" :operator-id "operator-1" :location "Nevada" :risk-level :high})
-        request {:manager-id "manager-1" :site {:site-id "site-high-risk"}}
-        proposal {:op :schedule-shift :effect :propose :confidence 0.95}
-        verdict (governor/check request {} proposal st)]
+  (let [verdict (check {:manager-id "manager-1" :site {:site-id "site-high-risk"}}
+                       {:op :schedule-shift :effect :propose :confidence 0.95})]
     (is (not (:ok? verdict)))
     (is (not (:hard? verdict)))
-    (is (:escalate? verdict))))
+    (is (true? (:escalate? verdict)))))
 
 (deftest escalates-low-confidence-proposal
-  (let [st (fresh-store)
-        request {:manager-id "manager-1"}
-        proposal {:op :log-production-report :effect :propose :confidence 0.5}
-        verdict (governor/check request {} proposal st)]
+  (let [verdict (check clean-request {:op :log-production-report :effect :propose :confidence 0.5})]
     (is (not (:ok? verdict)))
     (is (not (:hard? verdict)))
-    (is (:escalate? verdict))))
+    (is (true? (:escalate? verdict)))))
 
 (deftest hard-blocks-unregistered-site
-  (let [st (store/mem-store)
-        _ (store/register-manager! st {:manager-id "manager-1" :name "Alice Chen" :certifications ["MSHA"] :experience-years 12})
-        request {:manager-id "manager-1" :site {:site-id "unknown-site"}}
-        proposal {:op :coordinate-maintenance :effect :propose :confidence 0.95}
-        verdict (governor/check request {} proposal st)]
+  (let [verdict (check {:manager-id "manager-1" :site {:site-id "unknown-site"}}
+                       {:op :coordinate-maintenance :effect :propose :confidence 0.95})]
     (is (not (:ok? verdict)))
     (is (:hard? verdict))
-    (is (seq (:violations verdict)))))
+    (is (= [:no-site] (mapv :rule (:violations verdict))))))
 
 (deftest hard-blocks-non-propose-effect
-  (let [st (fresh-store)
-        request {:manager-id "manager-1"}
-        proposal {:op :schedule-shift :effect :commit :confidence 0.95}
-        verdict (governor/check request {} proposal st)]
+  (let [verdict (check clean-request {:op :schedule-shift :effect :commit :confidence 0.95})]
     (is (not (:ok? verdict)))
     (is (:hard? verdict))
-    (is (seq (:violations verdict)))))
+    (is (= [:no-actuation] (mapv :rule (:violations verdict))))))
+
+;; ---- measured on acfd967 -------------------------------------------------
+
+(deftest hard-on-undeclared-operation
+  (testing "the governor was a denylist; every op it had not been told about was ok? true"
+    (doseq [op [:authorize-blast :detonate :override-ventilation :delete-shift-record
+                :set-ore-grade :dispatch-crew-underground]]
+      (let [verdict (check clean-request {:op op :effect :propose :confidence 0.95})]
+        (is (:hard? verdict) (str op))
+        (is (false? (:ok? verdict)) (str op))
+        (is (= [:undeclared-operation] (mapv :rule (:violations verdict))) (str op))))))
+
+(deftest hard-on-every-reserved-operation-with-its-reason
+  (doseq [op [:extract :blast :set-production-target :mine-safety-auth
+              :equipment-sequence :ventilation-auth :ore-grade-assess]]
+    (let [verdict (check clean-request {:op op :effect :propose :confidence 0.95})]
+      (is (:hard? verdict) (str op))
+      (is (false? (:escalate? verdict)) (str op " must never be put to a human"))
+      (is (= [:operator-class-blocked] (mapv :rule (:violations verdict))) (str op))
+      (is (re-find #"exclusively operator/management authority"
+                   (get-in verdict [:violations 0 :detail]))
+          (str op)))))
+
+(deftest hard-on-a-string-op
+  (testing "a string op missed the keyword denylist and was admitted"
+    (let [verdict (check clean-request {:op "schedule-shift" :effect :propose :confidence 0.95})]
+      (is (:hard? verdict))
+      (is (= [:proposal-without-op] (mapv :rule (:violations verdict)))))))
+
+(deftest hard-on-confidence-out-of-range
+  (testing ":confidence 1.5 was admitted; \"high\" threw ClassCastException"
+    (doseq [c [1.5 -0.1 "high" :high]]
+      (let [verdict (check clean-request {:op :schedule-shift :effect :propose :confidence c})]
+        (is (:hard? verdict) (pr-str c))
+        (is (= [:confidence-out-of-range] (mapv :rule (:violations verdict))) (pr-str c))))))
+
+(deftest a-missing-confidence-escalates-rather-than-holds
+  (let [verdict (check clean-request {:op :schedule-shift :effect :propose})]
+    (is (not (:hard? verdict)))
+    (is (true? (:escalate? verdict)))
+    (is (= 0.0 (:confidence verdict)))))
+
+(deftest hard-on-a-request-without-a-site
+  (testing "the docstring said 'ops must involve a registered mine-site'; the code asked only when one was named"
+    (let [verdict (check {:manager-id "manager-1"} {:op :schedule-shift :effect :propose :confidence 0.95})]
+      (is (:hard? verdict))
+      (is (false? (:ok? verdict)))
+      (is (= [:request-without-site-id] (mapv :rule (:violations verdict)))))))
+
+(deftest hard-on-a-site-whose-risk-level-cannot-be-read
+  (testing "a :risk-level of :extreme, nil or \"high\" read as not-:high and never escalated"
+    (doseq [[site-id level] [["s-extreme" :extreme] ["s-none" nil] ["s-str" "high"]]]
+      (let [st (fresh-store)
+            _ (store/register-site! st (cond-> {:site-id site-id :operator-id "o" :location "x"}
+                                         (some? level) (assoc :risk-level level)))
+            verdict (governor/check {:manager-id "manager-1" :site {:site-id site-id}} {}
+                                    {:op :schedule-shift :effect :propose :confidence 0.95} st)]
+        (is (:hard? verdict) (pr-str level))
+        (is (= [:site-risk-level-undeclared] (mapv :rule (:violations verdict))) (pr-str level))))))
+
+(deftest hard-outranks-escalate-in-the-verdict
+  (testing "a reserved op at a high-risk site with low confidence holds; it is not put to a human"
+    (let [verdict (check {:manager-id "manager-1" :site {:site-id "site-high-risk"}}
+                         {:op :blast :effect :propose :confidence 0.1})]
+      (is (:hard? verdict))
+      (is (false? (:escalate? verdict))))))
+
+(deftest every-flag-is-a-boolean
+  (testing "measured on acfd967: :escalate? was nil for a request without a site"
+    (doseq [[request proposal] [[clean-request {:op :schedule-shift :effect :propose :confidence 0.95}]
+                                [{:manager-id "manager-1"} {:op :schedule-shift :effect :propose :confidence 0.95}]
+                                [clean-request {:op :flag-safety-concern :effect :propose :confidence 0.95}]
+                                [clean-request {:op :blast :effect :propose :confidence 0.95}]]]
+      (let [verdict (check request proposal)]
+        (is (boolean? (:ok? verdict)))
+        (is (boolean? (:hard? verdict)))
+        (is (boolean? (:escalate? verdict)))))))
+
+(deftest check-never-writes
+  (let [st (fresh-store)
+        before {:records (store/records st) :ledger (store/ledger st)}]
+    (doseq [proposal [{:op :schedule-shift :effect :propose :confidence 0.95}
+                      {:op :blast :effect :propose :confidence 0.95}
+                      {:op :flag-safety-concern :effect :propose :confidence 0.95}]]
+      (governor/check clean-request {} proposal st))
+    (is (= before {:records (store/records st) :ledger (store/ledger st)}))))

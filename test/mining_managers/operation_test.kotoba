@@ -1,0 +1,39 @@
+(ns mining-managers.operation-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [mining-managers.operation :as op]))
+
+(deftest supported-and-reserved-are-disjoint
+  (is (empty? (filter op/reserved? (keys op/supported))))
+  (is (empty? (filter op/supported? (keys op/reserved)))))
+
+(deftest the-four-supported-operations
+  (is (= #{:schedule-shift :log-production-report :coordinate-maintenance :flag-safety-concern}
+         (set (keys op/supported)))))
+
+(deftest only-the-safety-concern-escalates-by-itself
+  (is (true? (op/escalates? :flag-safety-concern)))
+  (doseq [o [:schedule-shift :log-production-report :coordinate-maintenance]]
+    (is (false? (op/escalates? o)) (str o)))
+  (testing "an unsupported op is not an escalation either -- the governor hard-blocks first"
+    (is (false? (op/escalates? :blast)))
+    (is (false? (op/escalates? :authorize-blast)))))
+
+(deftest the-readme-boundary-is-reserved
+  (testing "every name the old denylist carried is reserved, with a reason"
+    (doseq [o [:extract :blast :set-production-target :mine-safety-auth
+               :equipment-sequence :ventilation-auth :ore-grade-assess]]
+      (is (op/reserved? o) (str o))
+      (is (string? (op/reserved-reason o)) (str o))
+      (is (re-find #"exclusively operator/management authority" (op/reserved-reason o)) (str o)))))
+
+(deftest declared-is-the-union
+  (is (op/declared? :schedule-shift))
+  (is (op/declared? :blast))
+  (is (not (op/declared? :authorize-blast)))
+  (is (not (op/declared? :detonate)))
+  (is (not (op/declared? "schedule-shift")))
+  (is (not (op/declared? nil))))
+
+(deftest reserved-reason-is-nil-for-the-undeclared
+  (is (nil? (op/reserved-reason :authorize-blast)))
+  (is (nil? (op/reserved-reason :schedule-shift))))

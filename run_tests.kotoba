@@ -1,0 +1,144 @@
+(ns mining-managers.run-tests
+  "Load this actor's .kotoba sources and run its clojure.test suite,
+  refusing to report a pass on a run that came in under what the
+  README publishes.
+
+  ## Why this file exists
+
+  On 2026-09-10 an owner-instructed rename moved every .clj/.cljc
+  source and test in this repository to .kotoba (639da6f). The rename
+  is deliberate and is not reverted here. What it also did, silently,
+  was disconnect the suite: deps.edn ran cognitect.test-runner, and
+  clojure.tools.namespace resolves only .clj/.cljc. Measured on
+  acfd967, this repository's origin/main:
+
+      $ clojure -M:test
+      Ran 0 tests containing 0 assertions.
+      0 failures, 0 errors.                       # exit 0
+
+  This repository's README published no test count at all, so not even
+  a stale number contradicted that zero. The tests were never broken --
+  governor_test and actor_test are intact in the tree, and at the pin
+  before the rename (18aeef6) they ran as 12 tests / 34 assertions. The
+  runner had stopped being able to see them, and a suite that ran
+  nothing returns the same value as a suite that ran everything and
+  found no fault (CLAUDE.md, ADR-2608136000, question 2).
+
+  ## Why the runner is .kotoba and not .clj
+
+  A loader for .kotoba cannot itself be .kotoba if it must be loaded
+  by name -- but it need not be. `clojure -M <path>` hands the file to
+  Compiler.load(Reader), which never consults the extension. Only
+  `require`/`load` do. So the bootstrap stays inside the rename.
+
+  ## The floor
+
+  Discovery, load and execution each report a count, and zero is never
+  clean. The floor is not merely 'more than zero' but 'not less than
+  the README publishes' -- the weaker form would have been satisfied
+  by a single surviving test after the others were lost. A README that
+  stops publishing a count, or publishes zero, is itself a refusal: a
+  floor that silently becomes zero is not a floor.
+
+  Exit codes are three-valued, because 'the tests failed' and 'the
+  tests could not be run' are different answers and must not share
+  one:
+
+      0  ran, met the published floor, every assertion passed
+      1  ran, and something failed or errored
+      2  REFUSED -- could not answer (nothing found, nothing ran,
+         fewer than published, or a source would not read)"
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
+            [clojure.test :as test]))
+
+;; The loader is shared with run_sim.kotoba. `load-file` is correct here and
+;; not for the sources it goes on to read: this file carries no reader
+;; conditionals, so the Compiler's .cljc-only #?(...) rule does not bite.
+(load-file "load_sources.kotoba")
+
+(def describe mining-managers.bootstrap/describe)
+(def load-all! mining-managers.bootstrap/load-all!)
+(def source-ext mining-managers.bootstrap/source-ext)
+
+
+(defn published-floor
+  "The counts README.md publishes, as {:tests n :assertions n}, or nil
+  if it publishes none."
+  [root]
+  (let [f (io/file root "README.md")]
+    (when (.isFile f)
+      (when-let [[_ t a] (re-find #"(\d+)\s+tests?\s*/\s*(\d+)\s+assertions"
+                                  (slurp f))]
+        {:tests (parse-long t) :assertions (parse-long a)}))))
+
+(defn refuse! [msg]
+  (println (str "  REFUSING TO REPORT A PASS: " msg))
+  (flush)
+  (System/exit 2))
+
+(defn main! [args]
+  (let [evidence? (some #{"--evidence"} args)
+        root      (or (System/getProperty "mining-managers.root") ".")
+        sources   (try (describe root)
+                       (catch Exception e
+                         (refuse! (str "a source would not read -- " (.getMessage e)))))
+        test-nss  (->> sources (map :ns)
+                       (filter #(str/ends-with? (str %) "-test")) sort vec)
+        floor     (published-floor root)]
+    (println (format "  discovered: %d source(s), %d test namespace(s) under %s"
+                     (count sources) (count test-nss) root))
+    (println (format "  published floor (README.md): %s"
+                     (if floor
+                       (format "%d tests / %d assertions" (:tests floor) (:assertions floor))
+                       "NONE")))
+    (when evidence?
+      (doseq [s sources] (println "   " (:ns s) "<-" (:file s)))
+      (System/exit 0))
+
+    ;; Floor 0 -- the floor itself. A floor that silently becomes zero
+    ;; is not a floor, so its absence refuses rather than passes.
+    (when-not floor
+      (refuse! (str "README.md publishes no '<n> tests / <m> assertions' count. "
+                    "Without it this runner cannot tell a complete run from a "
+                    "truncated one.")))
+    (when (or (zero? (:tests floor)) (zero? (:assertions floor)))
+      (refuse! (format "README.md publishes a zero floor (%d tests / %d assertions)"
+                       (:tests floor) (:assertions floor))))
+
+    ;; Floor 1 -- discovery. An empty tree must not look like a clean one.
+    (when (zero? (count sources))
+      (refuse! (str "no sources found under " root "/{src,test} with extensions "
+                    (pr-str (sort source-ext)))))
+    (when (zero? (count test-nss))
+      (refuse! "no test namespaces found -- a suite with no tests is not a passing suite"))
+
+    (try (load-all! sources)
+         (catch Exception e
+           (refuse! (str "sources would not load -- " (.getMessage e)))))
+
+    (let [{:keys [test pass fail error]} (apply test/run-tests test-nss)
+          tests      (or test 0)
+          assertions (+ (or pass 0) (or fail 0) (or error 0))]
+      ;; Floor 2 -- execution. Loading is not running.
+      (when (zero? tests)
+        (refuse! (format "%d test namespace(s) loaded but 0 tests ran" (count test-nss))))
+      ;; Floor 3 -- the published count. Not 'more than zero': not less
+      ;; than what this repository tells the world it runs.
+      (when (or (< tests (:tests floor)) (< assertions (:assertions floor)))
+        (refuse! (format (str "ran %d tests / %d assertions, below the %d / %d "
+                              "README.md publishes. Either tests were lost, or "
+                              "the README is stale -- both need a human.")
+                         tests assertions (:tests floor) (:assertions floor))))
+      (if (pos? (+ (or fail 0) (or error 0)))
+        (do (println (format "  mining-managers: FAILED -- %d failure(s), %d error(s) over %d test(s)"
+                             fail error tests))
+            (flush)
+            (System/exit 1))
+        (do (println (format "  mining-managers: OK -- %d tests / %d assertions / %d namespaces (floor %d / %d)"
+                             tests assertions (count test-nss)
+                             (:tests floor) (:assertions floor)))
+            (flush)
+            (System/exit 0))))))
+
+(main! *command-line-args*)

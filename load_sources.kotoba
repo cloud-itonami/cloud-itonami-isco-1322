@@ -1,0 +1,109 @@
+(ns mining-managers.bootstrap
+  "Load this repository's .kotoba sources on the JVM, in dependency order.
+
+  ## Why this file exists
+
+  The 2026-09-10 owner-instructed rename moved every .clj/.cljc source and
+  test to .kotoba (639da6f). `require`/`load` resolve only .clj/.cljc, so from
+  that commit nothing on the JVM could load this repository by namespace name.
+  `clojure -M <path>` is the exception: it hands the file to
+  Compiler.load(Reader), which never consults the extension. So each entry
+  point is a path, and this namespace is what those entry points share.
+
+  It exists as a separate file because there are two of them --
+  `run_tests.kotoba` and `run_sim.kotoba` -- and a loader copied into both
+  would be one list written twice, which is how the two halves drift.
+
+  Two details are load-bearing, both learned from
+  cloud-itonami/tsukuroi's run_tests.kotoba:
+
+    * `load-file` fails here even given a correct path, because the Compiler
+      enables #?(...) from the FILENAME and only for .cljc. A .kotoba source
+      carrying reader conditionals is a hard `Conditional read not allowed`.
+      Hence the explicit {:read-cond :allow}.
+    * *file* is bound to the absolute path while evaluating, or every stack
+      frame in a failing test names the wrong file.
+
+  It reads .kotoba, .cljc and .clj alike, so it keeps working whichever way
+  the migration goes next."
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str])
+  (:import [clojure.lang LineNumberingPushbackReader]
+           [java.io File]))
+
+(def source-ext #{"kotoba" "cljc" "clj"})
+(def internal-prefix "mining-managers.")
+
+(def entry-points
+  "Namespaces that are entry points rather than library sources. They live at
+  the repository root, not under src/ or test/, so `sources-under` does not
+  reach them -- this set is belt-and-braces for the case where one is moved."
+  '#{mining-managers.bootstrap mining-managers.run-tests mining-managers.run-sim})
+(def read-opts {:read-cond :allow :features #{:clj} :eof ::eof})
+
+(defn ext-of [^String n]
+  (let [i (.lastIndexOf n ".")] (when (pos? i) (subs n (inc i)))))
+
+(defn sources-under [root dir]
+  (let [d (io/file root dir)]
+    (when (.isDirectory d)
+      (->> (file-seq d)
+           (filter #(.isFile ^File %))
+           (filter #(source-ext (ext-of (.getName ^File %))))
+           (sort-by #(.getPath ^File %))))))
+
+(defn forms-of
+  "Every top-level form in `f`, reader conditionals resolved for :clj.
+  Throws if the source will not read -- a source that cannot be read
+  is a refusal, never a skip."
+  [^File f]
+  (with-open [r (LineNumberingPushbackReader. (io/reader f))]
+    (doall (take-while #(not= ::eof %) (repeatedly #(read read-opts r))))))
+
+(defn internal-requires [ns-form]
+  (->> ns-form
+       (drop 2)
+       (filter #(and (seq? %) (= :require (first %))))
+       (mapcat rest)
+       (map #(if (vector? %) (first %) %))
+       (filter symbol?)
+       (filter #(str/starts-with? (str %) internal-prefix))
+       set))
+
+(defn describe
+  "{:file :abs :ns :requires :forms} for every source whose first form
+  declares a namespace. This runner excludes itself."
+  [root]
+  (->> (concat (sources-under root "src") (sources-under root "test"))
+       (keep (fn [^File f]
+               (let [forms (forms-of f)
+                     nm    (second (first forms))]
+                 (when (and (seq? (first forms))
+                            (= 'ns (ffirst forms))
+                            (symbol? nm)
+                            (not (entry-points nm)))
+                   {:file (.getPath f) :abs (.getAbsolutePath f) :ns nm
+                    :requires (internal-requires (first forms)) :forms forms}))))
+       vec))
+
+(defn mark-loaded! [n]
+  (dosync (commute @#'clojure.core/*loaded-libs* conj n)))
+
+(defn load-all!
+  "Eval every source in dependency order, registering each namespace as
+  loaded so the next file's :require resolves to it rather than
+  hunting the classpath for a file extension that is not there."
+  [sources]
+  (loop [pending (vec sources) loaded #{}]
+    (if (empty? pending)
+      loaded
+      (let [ready   (filterv #(every? loaded (:requires %)) pending)
+            blocked (filterv #(not (every? loaded (:requires %))) pending)]
+        (when (empty? ready)
+          (throw (ex-info "unresolvable require order among sources"
+                          {:pending (mapv (juxt :ns :requires) pending)})))
+        (doseq [{:keys [ns forms abs file]} ready]
+          (binding [*ns* *ns*, *file* abs, *source-path* file]
+            (doseq [f forms] (eval f)))
+          (mark-loaded! ns))
+        (recur blocked (into loaded (map :ns ready)))))))

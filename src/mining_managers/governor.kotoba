@@ -1,89 +1,138 @@
 (ns mining-managers.governor
-  "MiningManagerGovernor — the independent safety/traceability layer for the
+  "MiningManagerGovernor -- the independent safety/traceability layer for the
   ISCO-08 1322 mining manager administrative support actor. Wired as its own
-  `:govern` node in `mining-managers.actor`'s StateGraph, downstream of `:advise`
-  — the Advisor has no notion of manager/site provenance or high-risk operations,
-  so this MUST be a separate system able to reject a proposal (itonami actor
-  pattern, per ADR-2607011000 / CLAUDE.md Actors section).
+  `:govern` node in `mining-managers.actor`'s StateGraph, downstream of
+  `:advise` -- the Advisor has no notion of manager/site provenance or
+  high-risk operations, so this MUST be a separate system able to reject a
+  proposal (itonami actor pattern, per ADR-2607011000 / CLAUDE.md Actors
+  section).
 
   CRITICAL DOMAIN NOTE: This actor supports a MINING MANAGER's administrative
-  workflow — shift scheduling, production reporting, maintenance coordination,
-  safety flagging. It does NOT make extraction decisions, set production targets,
-  or determine mine-safety authority. Those remain the MANAGER/OPERATOR's
-  exclusive authority. Scope boundaries:
-    ✓ Shift and crew scheduling
-    ✓ Production data logging
-    ✓ Equipment maintenance scheduling
-    ✓ Safety concern flagging (always escalated)
-    ✗ Extraction/blasting decisions
-    ✗ Production targeting/quotas
-    ✗ Mine-safety authority determinations
-    ✗ Equipment operation sequencing
+  workflow -- shift scheduling, production reporting, maintenance
+  coordination, safety flagging. It does NOT make extraction decisions, set
+  production targets, or determine mine-safety authority. Those remain the
+  OPERATOR/MANAGEMENT's exclusive authority (`mining-managers.operation/reserved`).
 
   `check` is a pure function of (request, context, proposal, store) ->
-  verdict; it never mutates the store. The StateGraph's `:decide` node
-  routes on the verdict:
-    :hard? true                → :hold  (irreversible, no write)
-    :escalate? true            → :request-approval (interrupt-before)
-    otherwise                  → :commit
+  verdict; it never mutates the store. `mining-managers.phase/of-verdict`
+  routes on it.
 
-  HARD invariants (:hard? true, ALWAYS :hold, never overridable):
-    1. manager provenance      — the request's manager must be registered.
-    2. site provenance         — ops must involve a registered mine-site.
-    3. no-actuation            — proposal :effect must be :propose.
-    4. no-extraction           — any proposal flagged :op with operator-class
-                               ops (:extract/:blast/:set-production-target/
-                               :mine-safety-auth/:equipment-sequence) is an
-                               instant hard block with no override path.
+  ## What this namespace decides, and what it delegates
 
-  ESCALATION invariants (:escalate? true, ALWAYS human sign-off):
-    5. :op :flag-safety-concern — ALL safety concerns escalate.
-    6. high-risk site          — any operation on a site flagged :risk-level :high
-                               escalates.
-    7. low confidence          — < `confidence-floor`."
-  (:require [mining-managers.store :as store]))
+  It used to decide everything inline, and three of those decisions were
+  measurably wrong on acfd967. Each is now delegated to a namespace that can
+  be tested without building a graph:
+
+    vocabulary      -> mining-managers.operation  (was: a private set of
+                                                  seven operator-class ops,
+                                                  i.e. a denylist that
+                                                  admitted every op it had
+                                                  not been told about --
+                                                  :authorize-blast and
+                                                  :detonate were ok? true)
+    well-formedness -> mining-managers.facts      (was: no envelope check at
+                                                  all, so :confidence 1.5 was
+                                                  admitted, a string
+                                                  :confidence threw out of
+                                                  `check`, and a request that
+                                                  named no site skipped the
+                                                  high-risk-site rule)
+    routing         -> mining-managers.phase      (was: an inline `cond`,
+                                                  written twice)
+
+  ## HARD invariants (`:hard? true`, ALWAYS `:hold`, never overridable)
+
+    1. manager provenance    -- the request's manager must be registered.
+    2. site provenance       -- the request must name a mine-site, and that
+       site must be registered with a readable `:risk-level`. This is the
+       rule the previous docstring stated and the previous code did not
+       enforce: it asked only when a site happened to be named.
+    3. no-actuation          -- proposal `:effect` must be `:propose`.
+    4. no operator-class ops -- extraction, blasting, production targeting,
+       mine-safety determination, equipment sequencing, ventilation
+       authority and ore-grade assessment are exclusively operator/management
+       authority (`mining-managers.operation/reserved`).
+    5. declared vocabulary   -- an op outside
+       `mining-managers.operation/supported` is refused as undeclared. This
+       is the allowlist: it is what makes rule 4 a boundary rather than a
+       list of examples.
+    6. well-formed envelope  -- a proposal whose `:op` is not a keyword or
+       whose `:confidence` is present but not a number in [0,1] is refused
+       rather than compared against.
+
+  ## ESCALATION invariants (`:escalate? true`, ALWAYS human sign-off)
+
+    7. operations declared `:escalates?` (`:flag-safety-concern`).
+    8. any operation at a site registered `:risk-level :high`.
+    9. confidence below `confidence-floor`."
+  (:require [mining-managers.facts :as facts]
+            [mining-managers.operation :as op]
+            [mining-managers.store :as store]))
 
 (def confidence-floor 0.6)
 
-;; Ops that are hard-blocked (not in manager's domain; operator/management only)
-(def ^:private operator-class-ops
-  #{:extract :blast :set-production-target :mine-safety-auth
-    :equipment-sequence :ventilation-auth :ore-grade-assess})
+(defn- hard-violations
+  "Every hard rule, in one vector. Ordering is presentational only -- any
+  non-empty result holds."
+  [request proposal manager-record site-record]
+  (let [request-vs (facts/request-violations request)]
+    (into []
+          (concat
+           request-vs
+           (facts/proposal-violations proposal)
+           (facts/vocabulary-violations proposal)
+           ;; Provenance is asked only of a well-formed request; a request
+           ;; without a manager or site has already been reported above and
+           ;; reporting :no-manager / :no-site as well would say the same
+           ;; thing twice.
+           (when-not (seq request-vs)
+             (concat
+              (cond
+                (nil? manager-record)
+                [{:rule :no-manager :detail "unregistered manager"}]
 
-;; Ops that always escalate
-(def ^:private always-escalate-ops #{:flag-safety-concern})
+                :else
+                (facts/manager-record-violations manager-record))
+              (cond
+                (nil? site-record)
+                [{:rule :no-site :detail "unregistered mine-site"}]
 
-(defn- hard-violations [{:keys [proposal site-id]} manager-record site-record]
-  (cond-> []
-    (nil? manager-record)
-    (conj {:rule :no-manager :detail "unregistered manager"})
+                :else
+                (facts/site-record-violations site-record))))
+           (when (not= :propose (:effect proposal))
+             [{:rule :no-actuation :detail "effect must be :propose only (no direct write)"}])))))
 
-    (and site-id (nil? site-record))
-    (conj {:rule :no-site :detail "unregistered mine-site"})
-
-    (not= :propose (:effect proposal))
-    (conj {:rule :no-actuation :detail "effect must be :propose only (no direct write)"})
-
-    (contains? operator-class-ops (:op proposal))
-    (conj {:rule :operator-class-blocked
-           :detail "extraction/targeting/mine-safety ops are OPERATOR/MANAGEMENT-exclusive; not in manager's administrative scope"})))
+(defn- usable-confidence
+  "The confidence to compare against the floor. Only reached once
+  `facts/proposal-violations` has admitted the envelope, so a non-number here
+  is impossible rather than merely unlikely -- but an absent confidence is
+  legitimate and reads as 0.0, which escalates."
+  [proposal]
+  (let [c (:confidence proposal)]
+    (if (number? c) c 0.0)))
 
 (defn check
   "Assess a proposal against `request`/`context`/`proposal` and a
   `store` implementing `mining-managers.store/Store`. Returns
-  `{:ok? bool :violations [...] :confidence n :hard? bool :escalate? bool}`."
-  [request context proposal store]
-  (let [manager-record (store/manager store (:manager-id request))
-        site-id (get-in request [:site :site-id])
+  `{:ok? bool :violations [...] :confidence n :hard? bool :escalate? bool}`,
+  with every flag a boolean -- on acfd967 `:escalate?` came back `nil` for a
+  request without a site, because `(and site-record ...)` was folded into it."
+  ;; `context` is part of the node's signature and is deliberately unused:
+  ;; this governor's rules are all functions of the request, the proposal,
+  ;; the registered manager and the registered site. It is named with a
+  ;; leading underscore so that stays a statement rather than an oversight.
+  [request _context proposal store]
+  (let [manager-record (when (map? request) (store/manager store (:manager-id request)))
+        site-id (when (map? request) (get-in request [:site :site-id]))
         site-record (when site-id (store/mine-site store site-id))
-        hard (hard-violations {:proposal proposal :site-id site-id} manager-record site-record)
+        hard (hard-violations request proposal manager-record site-record)
         hard? (boolean (seq hard))
-        conf (or (:confidence proposal) 0.0)
+        conf (usable-confidence proposal)
         low? (< conf confidence-floor)
-        safety-op? (contains? always-escalate-ops (:op proposal))
-        high-risk? (and site-record (= :high (:risk-level site-record)))]
-    {:ok? (and (not hard?) (not low?) (not safety-op?) (not high-risk?))
+        escalating-op? (op/escalates? (:op proposal))
+        high-risk? (boolean (and (map? site-record) (= :high (:risk-level site-record))))]
+    {:ok? (and (not hard?) (not low?) (not escalating-op?) (not high-risk?))
      :violations hard
      :confidence conf
      :hard? hard?
-     :escalate? (and (not hard?) (or low? safety-op? high-risk?))}))
+     :escalate? (boolean (and (not hard?) (or low? escalating-op? high-risk?)))}))
