@@ -74,22 +74,22 @@ human-in-the-loop interrupt/resume via checkpointing.
                                            +-> :hold               (:hard? true)
 ```
 
-- `src/mining_managers/store.cljc` — `Store` protocol + `MemStore`:
+- `src/mining_managers/store.kotoba` — `Store` protocol + `MemStore`:
   registered managers, registered mine-sites, committed records, an append-only audit ledger.
-- `src/mining_managers/advisor.cljc` — `Advisor` protocol; `mock-advisor`
+- `src/mining_managers/advisor.kotoba` — `Advisor` protocol; `mock-advisor`
   (deterministic, default) proposes a managerial operation from a
   request; `llm-advisor` wraps a `langchain.model/ChatModel` — either
   way the advisor only ever produces a `:propose`-effect proposal,
   never a committed record, and LLM parse failures always yield
   `confidence 0.0` (forces escalation, never fabricated confidence).
-- `src/mining_managers/governor.cljc` — `MiningManagerGovernor/check`: a pure
+- `src/mining_managers/governor.kotoba` — `MiningManagerGovernor/check`: a pure
   function, wired as its own `:govern` node. Hard invariants
   (unregistered manager, unregistered mine-site, a proposal whose `:effect`
   isn't `:propose`, or any operator-class op) always route to `:hold`.
   Escalation invariants (`:flag-safety-concern`, high-risk site operations, or low advisor
   confidence) always route to `:request-approval` — an `interrupt-before` node that the graph
   checkpoints and only resumes on explicit human approval (`actor/approve!`).
-- `src/mining_managers/actor.cljc` — `build-graph`, `run-request!`,
+- `src/mining_managers/actor.kotoba` — `build-graph`, `run-request!`,
   `approve!`: the `langgraph.graph/state-graph` wiring itself.
 
 ```bash
