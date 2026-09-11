@@ -7,7 +7,7 @@
   `mining-managers.sim` is the harness; this is only the way to start it. It
   needs to be separate because `-m mining-managers.sim` cannot work on this
   tree -- `-m` resolves a namespace through `require`, and `require` looks for
-  .clj/.cljc. `clojure -M <path>` loads by reader and ignores the extension,
+  .clj/.cljc. `kbb -M <path>` loads by reader and ignores the extension,
   so the entry point is a path. The loading itself is
   `mining-managers.bootstrap`, shared with run_tests.kotoba.
 

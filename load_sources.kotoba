@@ -6,7 +6,7 @@
   The 2026-09-10 owner-instructed rename moved every .clj/.cljc source and
   test to .kotoba (639da6f). `require`/`load` resolve only .clj/.cljc, so from
   that commit nothing on the JVM could load this repository by namespace name.
-  `clojure -M <path>` is the exception: it hands the file to
+  `kbb -M <path>` is the exception: it hands the file to
   Compiler.load(Reader), which never consults the extension. So each entry
   point is a path, and this namespace is what those entry points share.
 

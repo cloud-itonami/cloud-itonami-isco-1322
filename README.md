@@ -80,7 +80,7 @@ advise/govern/decide in a threading macro and stopped before writing, and
 `approve!` set `:committed` on whatever map it was handed -- including a held
 one. Measured through it, a clean request, a safety concern and its approval
 all left the store with 0 records and an empty ledger. The graph below is the
-one that runs now; `clojure -M:sim` is how to watch it refuse.
+one that runs now; `kbb -M:sim` is how to watch it refuse.
 
 ### Proposal operations (`mining-managers.operation/supported`, all `:effect :propose`)
 
@@ -154,9 +154,9 @@ hash-chained (`mining-managers.ledger/verify`).
 ### Running it
 
 ```bash
-clojure -M:test   # 79 tests / 375 assertions across 8 namespaces; refuses (exit 2) below that floor
-clojure -M:sim    # the scenario table; exit 1 if it demonstrates no refusal
-clojure -M:lint   # clj-kondo over the .kotoba sources by explicit file list; exit 2 if it found none
+kbb -M:test   # 79 tests / 375 assertions across 8 namespaces; refuses (exit 2) below that floor
+kbb -M:sim    # the scenario table; exit 1 if it demonstrates no refusal
+kbb -M:lint   # clj-kondo over the .kotoba sources by explicit file list; exit 2 if it found none
 ```
 
 The three entry points are `run_tests.kotoba`, `run_sim.kotoba` and `run_lint.kotoba`,
