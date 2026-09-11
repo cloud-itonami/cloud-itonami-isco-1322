@@ -12,7 +12,7 @@
   clojure.tools.namespace resolves only .clj/.cljc. Measured on
   acfd967, this repository's origin/main:
 
-      $ clojure -M:test
+      $ kbb -M:test
       Ran 0 tests containing 0 assertions.
       0 failures, 0 errors.                       # exit 0
 
@@ -27,7 +27,7 @@
   ## Why the runner is .kotoba and not .clj
 
   A loader for .kotoba cannot itself be .kotoba if it must be loaded
-  by name -- but it need not be. `clojure -M <path>` hands the file to
+  by name -- but it need not be. `kbb -M <path>` hands the file to
   Compiler.load(Reader), which never consults the extension. Only
   `require`/`load` do. So the bootstrap stays inside the rename.
 

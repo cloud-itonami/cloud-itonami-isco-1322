@@ -6,7 +6,7 @@
   ;; every source and test to .kotoba, which clojure.tools.namespace does not
   ;; resolve -- cognitect.test-runner then found nothing, ran nothing and
   ;; exited 0 (measured on acfd967: `Ran 0 tests containing 0 assertions`).
-  ;; `clojure -M <path>` loads by reader and ignores the extension, so the
+  ;; `kbb -M <path>` loads by reader and ignores the extension, so the
   ;; runner stays inside the rename. It refuses (exit 2) rather than report a
   ;; pass when the run comes in under what README.md publishes.
   :test {:extra-paths ["test"]
