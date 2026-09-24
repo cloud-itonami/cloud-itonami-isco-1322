@@ -1,8 +1,17 @@
 {:paths ["src"]
- :deps {io.github.kotoba-lang/langgraph
+ :deps {
+        ;; kotoba.robotics.process: the process-physics solvers and probe this
+        ;; repo's physics.edn runs on (physical-AI bot, scripts/physical-ai-bots).
+        io.github.kotoba-lang/robotics {:local/root "../../kotoba-lang/robotics"}
+io.github.kotoba-lang/langgraph
         {:git/sha "5b4e5e70837b849b14b6a5800894e3be202ad5fa"}}
  :aliases
- {;; run_tests.kotoba, not cognitect.test-runner. The 2026-09-10 rename moved
+ {
+  ;; kbb -M:physics -> the physical-AI bot's measurement: runs physics.edn on
+  ;; kotoba.robotics.process and prints one probe map. Exit 2 = could not measure.
+  :physai-test {:extra-paths ["test"] :main-opts ["-m" "cognitect.test-runner"]}
+  :physics {:main-opts ["-m" "kotoba.robotics.process.probe"]}
+;; run_tests.kotoba, not cognitect.test-runner. The 2026-09-10 rename moved
   ;; every source and test to .kotoba, which clojure.tools.namespace does not
   ;; resolve -- cognitect.test-runner then found nothing, ran nothing and
   ;; exited 0 (measured on acfd967: `Ran 0 tests containing 0 assertions`).
