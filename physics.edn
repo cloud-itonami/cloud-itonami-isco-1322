@@ -1,0 +1,34 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:physics` runs it.
+;;
+;; README "Robotics premise": a coordination robot performs shift scheduling,
+;; production data entry and maintenance scheduling for mining managers
+;; (ISCO 1322); extraction, blasting, production targeting and mine-safety
+;; decisions stay management-exclusive and are permanently blocked. Its
+;; physical work is maintenance logistics -- carrying scheduled spare parts
+;; along the level drift to the workshop -- and the maintenance check it
+;; schedules on a level sump that drains by gravity through a borehole.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+;; Replacing an estimate with a sourced value is this bot's growth work.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isco-1322"
+ :cases
+ [{:id :spare-parts-drift-run
+   :kind :transport
+   :procedure "carrier robot takes the shift's scheduled spare parts 400 m along the level haulage drift (wet gravel floor) to the underground workshop"
+   :params {:mass-kg 150.0 :distance-m 400.0 :v-max-mps 1.5 :a-max-mps2 0.4
+            :brake-decel-mps2 0.8 :drive-force-n 250.0 :crr 0.05
+            :cog-height-m 0.55 :support-half-length-m 0.40 :max-time-s 1800.0}
+   :sweep {:param :payload-kg :values [20.0 80.0 150.0 250.0 330.0]}
+   :quantity :cycle-time-s
+   :limit {:max 330.0 :basis "estimate: parts must reach the workshop within the first ~6 minutes of the maintenance window"}
+   :boundary {:lo 5.0 :hi 360.0}}
+  {:id :level-sump-gravity-drain
+   :kind :tank-drain
+   :procedure "maintenance check on a 40 m2 level sump that drains by gravity through a 150 mm borehole to the main pump station; groundwater inflow swept"
+   :params {:tank-area-m2 40.0 :h0-m 0.5 :h-target-m 0.1 :orifice-area-m2 0.0177 :cd 0.62 :dt-s 1.0 :max-time-s 86400.0}
+   :sweep {:param :q-in-m3s :values [0.02 0.04 0.06 0.08 0.10]}
+   :quantity :equilibrium-level-m
+   :limit {:max 2.5 :basis "estimate: sump wall height before water backs up into the drift"}
+   :boundary {:lo 0.005 :hi 0.12}}]}
