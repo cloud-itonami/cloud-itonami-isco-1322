@@ -22,7 +22,7 @@
   before the rename (18aeef6) they ran as 12 tests / 34 assertions. The
   runner had stopped being able to see them, and a suite that ran
   nothing returns the same value as a suite that ran everything and
-  found no fault (CLAUDE.md, ADR-2608136000, question 2).
+  found no fault (AGENTS.md, ADR-2608136000, question 2).
 
   ## Why the runner is .kotoba and not .clj
 
